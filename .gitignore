@@ -1,8 +1,3 @@
-# Generated reports (do not commit real environment reports)
-AD_Topology_*.html
-AD_DCInventory_*.html
-AD_Overview_*.html
-
 # OS / editor noise
 Thumbs.db
 .DS_Store
