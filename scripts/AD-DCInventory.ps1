@@ -97,6 +97,23 @@ function Test-DCOnline {
     param([string]$name)
     try { return (Test-Connection -ComputerName $name -Count 1 -Quiet -ErrorAction SilentlyContinue) } catch { return $false }
 }
+# Open a CIM session over WinRM if possible, else fall back to DCOM. Returns @{ session; via } or $null.
+function New-DCSession {
+    param([string]$HostName)
+    $local = $env:COMPUTERNAME
+    if (($HostName -split '\.')[0] -ieq $local) {
+        try { return @{ session = (New-CimSession -ErrorAction Stop); via = 'Local' } } catch { return $null }
+    }
+    try {
+        $s = New-CimSession -ComputerName $HostName -OperationTimeoutSec 10 -ErrorAction Stop
+        return @{ session = $s; via = 'WinRM' }
+    } catch {}
+    try {
+        $s = New-CimSession -ComputerName $HostName -SessionOption (New-CimSessionOption -Protocol Dcom) -OperationTimeoutSec 15 -ErrorAction Stop
+        return @{ session = $s; via = 'DCOM' }
+    } catch {}
+    return $null
+}
 
 $DCs = @()
 $idx = 0
@@ -114,19 +131,23 @@ foreach ($item in $DCList) {
     try { if ($dc.OperatingSystemVersion) { $build = ($dc.OperatingSystemVersion -replace '[()]','') } } catch {}
 
     if ($online -and -not $SkipHardware) {
-        try {
-            $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $name -ErrorAction Stop
-            if ($os.LastBootUpTime) {
-                $up = (Get-Date) - $os.LastBootUpTime
-                $uptime = "$([int]$up.TotalDays)d $($up.Hours)h"
-            }
-            $serverTime = ([datetime]$os.LocalDateTime).ToString('yyyy-MM-dd HH:mm')
-            if ($os.BuildNumber) { $build = $os.BuildNumber }
-        } catch {}
-        try {
-            $tz = Get-CimInstance -ClassName Win32_TimeZone -ComputerName $name -ErrorAction Stop
-            if ($tz.Caption) { $timeZone = $tz.Caption }
-        } catch {}
+        $sess = New-DCSession -HostName $name
+        if ($sess) {
+            try {
+                $os = Get-CimInstance -ClassName Win32_OperatingSystem -CimSession $sess.session -ErrorAction Stop
+                if ($os.LastBootUpTime) {
+                    $up = (Get-Date) - $os.LastBootUpTime
+                    $uptime = "$([int]$up.TotalDays)d $($up.Hours)h"
+                }
+                $serverTime = ([datetime]$os.LocalDateTime).ToString('yyyy-MM-dd HH:mm')
+                if ($os.BuildNumber) { $build = $os.BuildNumber }
+            } catch {}
+            try {
+                $tz = Get-CimInstance -ClassName Win32_TimeZone -CimSession $sess.session -ErrorAction Stop
+                if ($tz.Caption) { $timeZone = $tz.Caption }
+            } catch {}
+            try { Remove-CimSession $sess.session -ErrorAction SilentlyContinue } catch {}
+        }
     }
 
     # OS support classification
@@ -168,30 +189,38 @@ if (-not $SkipHardware) {
         Write-Host "      [$idx/$($DCs.Count)] $($d.shortName)" -ForegroundColor DarkGray
         $name = $d.name
 
+        # Open a session (WinRM -> DCOM). Reuse it for every query below.
+        $sess = New-DCSession -HostName $name
+        if (-not $sess) {
+            Write-Host "         no CIM session (WinRM and DCOM both refused) - hardware/perf skipped" -ForegroundColor DarkYellow
+            continue
+        }
+        $S = $sess.session
+
         # ---- Hardware ----
         $hw = [ordered]@{
             manufacturer='Unavailable'; model='Unavailable'; bios='Unavailable'; serial='Unavailable'
-            ramTotalGB='Unavailable'; cpus=@(); volumes=@(); nics=@()
+            ramTotalGB='Unavailable'; cpus=@(); volumes=@(); nics=@(); collectedVia=$sess.via
         }
         try {
-            $cs = Get-CimInstance Win32_ComputerSystem -ComputerName $name -ErrorAction Stop
+            $cs = Get-CimInstance Win32_ComputerSystem -CimSession $S -ErrorAction Stop
             $hw.manufacturer = "$($cs.Manufacturer)"
             $hw.model        = "$($cs.Model)"
             if ($cs.TotalPhysicalMemory) { $hw.ramTotalGB = [math]::Round($cs.TotalPhysicalMemory/1GB, 1) }
         } catch {}
         try {
-            $bios = Get-CimInstance Win32_BIOS -ComputerName $name -ErrorAction Stop
+            $bios = Get-CimInstance Win32_BIOS -CimSession $S -ErrorAction Stop
             $hw.bios   = "$($bios.SMBIOSBIOSVersion)"
             $hw.serial = "$($bios.SerialNumber)"
         } catch {}
         try {
-            $cpus = Get-CimInstance Win32_Processor -ComputerName $name -ErrorAction Stop
+            $cpus = Get-CimInstance Win32_Processor -CimSession $S -ErrorAction Stop
             foreach ($c in $cpus) {
                 $hw.cpus += [PSCustomObject]@{ name="$($c.Name)".Trim(); cores=[int]$c.NumberOfCores; logical=[int]$c.NumberOfLogicalProcessors; clock="$($c.MaxClockSpeed) MHz" }
             }
         } catch {}
         try {
-            $vols = Get-CimInstance Win32_LogicalDisk -ComputerName $name -Filter "DriveType=3" -ErrorAction Stop
+            $vols = Get-CimInstance Win32_LogicalDisk -CimSession $S -Filter "DriveType=3" -ErrorAction Stop
             foreach ($v in $vols) {
                 $sizeGB = if ($v.Size) { [math]::Round($v.Size/1GB,1) } else { 0 }
                 $freeGB = if ($v.FreeSpace) { [math]::Round($v.FreeSpace/1GB,1) } else { 0 }
@@ -200,7 +229,7 @@ if (-not $SkipHardware) {
             }
         } catch {}
         try {
-            $nics = Get-CimInstance Win32_NetworkAdapterConfiguration -ComputerName $name -Filter "IPEnabled=True" -ErrorAction Stop
+            $nics = Get-CimInstance Win32_NetworkAdapterConfiguration -CimSession $S -Filter "IPEnabled=True" -ErrorAction Stop
             foreach ($n in $nics) {
                 $ip = ($n.IPAddress | Where-Object { $_ -notmatch ':' }) -join ', '
                 $hw.nics += [PSCustomObject]@{ desc="$($n.Description)"; ip="$ip"; mac="$($n.MACAddress)" }
@@ -211,11 +240,11 @@ if (-not $SkipHardware) {
         # ---- Performance ----
         $perf = [ordered]@{ cpuUsage='Unavailable'; memUsage='Unavailable'; memDetail=''; adDbSizeMB='Unavailable'; logSizeMB='Unavailable'; disks=@() }
         try {
-            $cpu = Get-CimInstance Win32_Processor -ComputerName $name -ErrorAction Stop | Measure-Object -Property LoadPercentage -Average
+            $cpu = Get-CimInstance Win32_Processor -CimSession $S -ErrorAction Stop | Measure-Object -Property LoadPercentage -Average
             if ($cpu.Average -ne $null) { $perf.cpuUsage = "$([math]::Round($cpu.Average,0))%" }
         } catch {}
         try {
-            $os = Get-CimInstance Win32_OperatingSystem -ComputerName $name -ErrorAction Stop
+            $os = Get-CimInstance Win32_OperatingSystem -CimSession $S -ErrorAction Stop
             if ($os.TotalVisibleMemorySize) {
                 $usedPct = [math]::Round(((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/$os.TotalVisibleMemorySize)*100),0)
                 $usedGB  = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/1MB,1)
@@ -224,14 +253,11 @@ if (-not $SkipHardware) {
                 $perf.memDetail = "$usedGB / $totGB GB"
             }
         } catch {}
-        # AD database (NTDS.dit) + log size via registry-pointed path
+        # AD database (NTDS.dit) size via registry-pointed path
         try {
-            $reg = Get-CimInstance -ClassName StdRegProv -Namespace root\default -ComputerName $name -ErrorAction Stop
-            # DSA Database file path
-            $dsaPath = (Invoke-CimMethod -InputObject $reg -MethodName GetStringValue -Arguments @{ hDefKey=[uint32]2147483650; sSubKeyName='SYSTEM\CurrentControlSet\Services\NTDS\Parameters'; sValueName='DSA Database file' } -ErrorAction Stop).sValue
+            $dsaPath = (Invoke-CimMethod -CimSession $S -Namespace root\default -ClassName StdRegProv -MethodName GetStringValue -Arguments @{ hDefKey=[uint32]2147483650; sSubKeyName='SYSTEM\CurrentControlSet\Services\NTDS\Parameters'; sValueName='DSA Database file' } -ErrorAction Stop).sValue
             if ($dsaPath) {
-                $ditPath = $dsaPath -replace '^([A-Za-z]):', '$1$'
-                $dit = Get-CimInstance CIM_DataFile -ComputerName $name -Filter "Name='$($dsaPath -replace '\\','\\\\')'" -ErrorAction SilentlyContinue
+                $dit = Get-CimInstance CIM_DataFile -CimSession $S -Filter "Name='$($dsaPath -replace '\\','\\\\')'" -ErrorAction SilentlyContinue
                 if ($dit.FileSize) { $perf.adDbSizeMB = [math]::Round($dit.FileSize/1MB,0) }
             }
         } catch {}
@@ -241,6 +267,8 @@ if (-not $SkipHardware) {
             }
         } catch {}
         $d.performance = [PSCustomObject]$perf
+
+        try { Remove-CimSession $S -ErrorAction SilentlyContinue } catch {}
     }
 } else {
     Write-Host "[3/3] Hardware/performance skipped (-SkipHardware)" -ForegroundColor DarkGray
@@ -278,13 +306,13 @@ $HTML = @"
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg:#f4f7fb; --surface:#ffffff; --surface2:#eef3f9; --surface3:#dde7f2; --border:#e2eaf3; --text:#0f1e33; --muted:#5e7292;
-  --accent:#2563eb; --accent-2:#3b82f6; --accent-soft:#dbe8fe; --navy:#1e3a8a;
+  --bg:#f5f6fb; --surface:#ffffff; --surface2:#eef1f9; --surface3:#dfe4f2; --border:#e4e7f2; --text:#161a2e; --muted:#64708c;
+  --accent:#4f46e5; --accent-2:#6366f1; --accent-soft:#e6e6fd; --navy:#3730a3; --violet:#6d28d9; --fuchsia:#c026d3;
   --green:#059669; --green-soft:#d1fae5; --red:#dc2626; --red-soft:#fde2e2; --amber:#d97706; --amber-soft:#fef3c7;
-  --teal:#0d9488; --teal-soft:#cdeee9; --purple:#7c3aed; --purple-soft:#ede9fe;
-  --radius:12px; --radius-sm:8px;
-  --shadow:0 2px 6px rgb(30 60 120 / 0.06), 0 1px 2px rgb(30 60 120 / 0.04);
-  --shadow-hover:0 8px 22px rgb(30 60 120 / 0.13);
+  --blue:#2563eb; --blue-soft:#dbe8fe; --teal:#0d9488; --teal-soft:#cdeee9; --purple:#7c3aed; --purple-soft:#ede9fe; --pink:#db2777; --pink-soft:#fce7f3; --cyan:#0891b2; --cyan-soft:#cffafe;
+  --radius:13px; --radius-sm:9px;
+  --shadow:0 2px 8px rgb(60 50 140 / 0.06), 0 1px 2px rgb(60 50 140 / 0.04);
+  --shadow-hover:0 9px 26px rgb(60 50 140 / 0.14);
   --font:'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --mono:'SFMono-Regular', ui-monospace, Menlo, Consolas, monospace;
 }

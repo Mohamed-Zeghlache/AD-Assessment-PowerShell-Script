@@ -24,6 +24,8 @@ Each module has its own distinct visual design so reports are instantly recognis
 
 The forest-wide summary — the natural landing page for the whole audit. Hero banner with forest facts (functional level, schema version, FSMO masters, tombstone lifetime), object-count KPI cards, donut charts for directory objects and account posture, bar charts for computer OS distribution and group breakdown, and a per-domain comparison table.
 
+Stat cards that represent a list of objects (enabled / disabled / stale / never-logged-on / locked / password-never-expires accounts, computers, and security / distribution / scoped groups) include a **download icon** that exports that exact list to CSV — Name, SamAccountName, Enabled, LastLogon, and DN — entirely client-side, straight from the report.
+
 \`\`\`powershell
 .\scripts\AD-Overview.ps1
 \`\`\`
@@ -35,6 +37,11 @@ The forest-wide summary — the natural landing page for the whole audit. Hero b
 ![AD Topology demo](docs/topology-demo.gif)
 
 An interactive, pannable/zoomable map of the forest. Nested cards for forest → domain → site → DC, colour-coded by health. Click anything for a slide-in detail panel: forest info, domain FSMO holders, site subnets, or a rich DC panel with services, resources, replication status, and dcdiag results. Toggleable inter-site replication link overlay with cost and frequency labels.
+
+The toolbar also opens three analysis panels:
+
+- **Replication Health Matrix** — a directional source → destination grid of every DC partnership across **every domain in the forest**, built from the replication metadata AD already tracks. It checks **all naming contexts** (domain, Configuration, Schema, DomainDnsZones, ForestDnsZones), not just the default partition, and each cell shows the **worst** partition — so a pair that is healthy on the domain NC but failing on Configuration still shows as failing. Click any cell for the full per-partition breakdown. Reads over ADWS (TCP 9389) and falls back to `repadmin`/RPC when ADWS is unreachable. "Delayed" thresholds are site-aware (`-ReplDelayIntraSiteHours`, default 1; `-ReplDelayInterSiteHours`, default 6) so healthy inter-site partners on the standard 180-minute schedule aren't flagged. Passive; no network probing.
+- **Stale / Lingering Objects** — a read-only scan of the Configuration partition and Sites & Services for orphaned DC metadata, empty sites, sites without subnets, unlinked subnets, and lingering replication connections — each with the recommended remediation.
 
 \`\`\`powershell
 .\scripts\AD-Topology.ps1
@@ -113,6 +120,6 @@ Watch or ⭐ the repo to catch new modules as they land.
 
 ## Author
 
-**Mohamed ZEGHLACHE** — Hybrid Cloud Engineer 
+**Mohamed ZEGHLACHE** — Hybrid Cloud Engineer.
 
 If this is useful, a ⭐ on the repo is appreciated, and feedback / issues are welcome.

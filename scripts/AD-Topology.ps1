@@ -38,7 +38,12 @@
 [CmdletBinding()]
 param(
     [string]$OutputPath = (Get-Location).Path,
-    [switch]$OpenReport = $true
+    [switch]$OpenReport = $true,
+    # A partner is flagged "delayed" when its last successful replication is older than
+    # these thresholds. Inter-site defaults to 6h because the DEFAULT site-link schedule
+    # is 180 minutes - a flat 3h threshold produces false positives.
+    [int]$ReplDelayIntraSiteHours = 1,
+    [int]$ReplDelayInterSiteHours = 6
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,7 +87,7 @@ function Get-DCLiveHealth {
         ramTotalGB='N/A'; ramFreePct='N/A'; cpuFreePct='N/A'
         osDiskFreeGB='N/A'; osDiskFreePct='N/A'
         timeSkew='N/A'; sysvolShare='N/A'; netlogonShare='N/A'
-        replErrors='N/A'; maxReplDelayH='N/A'; dcdiag=''
+        replErrors='N/A'; maxReplDelayH='N/A'; dcdiag=''; ntpSource='N/A'
     }
     $short = $HostName.Split('.')[0]
     $isLocal = ($short -ieq $LocalName)
@@ -128,20 +133,27 @@ function Get-DCLiveHealth {
             $svcs=Get-CimInstance Win32_Service -CimSession $cim -ErrorAction SilentlyContinue | Where-Object { $svcMap.ContainsKey($_.Name) }
             foreach ($s in $svcs) { $r[$svcMap[$s.Name]]=$s.State }
         } catch {}
-        # Pending reboot + NTLMv1 via remote registry (StdRegProv works over DCOM)
+        # Pending reboot + NTLMv1 via remote registry (StdRegProv methods work directly)
         try {
-            $reg=Get-CimInstance -CimSession $cim -Namespace root\default -ClassName StdRegProv -ErrorAction SilentlyContinue
-            if ($reg) {
-                $pending=$false
-                foreach ($k in @('SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending','SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')) {
-                    $res=Invoke-CimMethod -CimSession $cim -Namespace root\default -ClassName StdRegProv -MethodName EnumKey -Arguments @{ hDefKey=[uint32]2147483650; sSubKeyName=$k } -ErrorAction SilentlyContinue
-                    if ($res -and $res.ReturnValue -eq 0) { $pending=$true }
-                }
-                $r.pendingReboot=if($pending){'Pending'}else{'OK'}
-                $lm=Invoke-CimMethod -CimSession $cim -Namespace root\default -ClassName StdRegProv -MethodName GetDWORDValue -Arguments @{ hDefKey=[uint32]2147483650; sSubKeyName='SYSTEM\CurrentControlSet\Control\Lsa'; sValueName='LmCompatibilityLevel' } -ErrorAction SilentlyContinue
-                if ($lm -and $lm.ReturnValue -eq 0 -and $lm.uValue -ne $null) {
-                    $r.ntlmv1=if($lm.uValue -lt 3){'Enabled (level '+$lm.uValue+')'}else{'Disabled (level '+$lm.uValue+')'}
-                }
+            $pending=$false; $regOk=$false
+            foreach ($k in @('SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending','SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')) {
+                $res=Invoke-CimMethod -CimSession $cim -Namespace root\default -ClassName StdRegProv -MethodName EnumKey -Arguments @{ hDefKey=[uint32]2147483650; sSubKeyName=$k } -ErrorAction SilentlyContinue
+                if ($res -ne $null) { $regOk=$true }
+                if ($res -and $res.ReturnValue -eq 0) { $pending=$true }
+            }
+            if ($regOk) { $r.pendingReboot=if($pending){'Pending'}else{'OK'} }
+            $lm=Invoke-CimMethod -CimSession $cim -Namespace root\default -ClassName StdRegProv -MethodName GetDWORDValue -Arguments @{ hDefKey=[uint32]2147483650; sSubKeyName='SYSTEM\CurrentControlSet\Control\Lsa'; sValueName='LmCompatibilityLevel' } -ErrorAction SilentlyContinue
+            if ($lm -and $lm.ReturnValue -eq 0 -and $lm.uValue -ne $null) {
+                $r.ntlmv1=if($lm.uValue -lt 3){'Enabled (level '+$lm.uValue+')'}else{'Disabled (level '+$lm.uValue+')'}
+            } elseif ($lm -and $lm.ReturnValue -eq 0) {
+                # value exists but is 0 - which is NTLMv1 enabled
+                $r.ntlmv1='Enabled (level 0)'
+            }
+            # NTP source (configured NtpServer under W32Time Parameters)
+            $ntp=Invoke-CimMethod -CimSession $cim -Namespace root\default -ClassName StdRegProv -MethodName GetStringValue -Arguments @{ hDefKey=[uint32]2147483650; sSubKeyName='SYSTEM\CurrentControlSet\Services\W32Time\Parameters'; sValueName='NtpServer' } -ErrorAction SilentlyContinue
+            if ($ntp -and $ntp.ReturnValue -eq 0 -and $ntp.sValue) {
+                # Strip the ",0x9" flags that AD DCs append
+                $r.ntpSource=($ntp.sValue -split '\s+' | ForEach-Object { ($_ -split ',')[0] } | Where-Object { $_ }) -join ', '
             }
         } catch {}
         try { Remove-CimSession $cim -ErrorAction SilentlyContinue } catch {}
@@ -151,8 +163,24 @@ function Get-DCLiveHealth {
     try { $r.sysvolShare=if(Test-Path "\\$HostName\SYSVOL" -EA SilentlyContinue){'OK'}else{'Fail'} } catch {}
     try { $r.netlogonShare=if(Test-Path "\\$HostName\NETLOGON" -EA SilentlyContinue){'OK'}else{'Fail'} } catch {}
 
-    # Replication failures
+    # Replication failures + oldest partner delay (worst-case time since last successful replication)
     try { $rf=Get-ADReplicationFailure -Target $HostName -ErrorAction SilentlyContinue; $r.replErrors=if($rf){@($rf).Count}else{0} } catch {}
+    try {
+        $meta=@(Get-ADReplicationPartnerMetadata -Target $HostName -Scope Server -ErrorAction SilentlyContinue)
+        if ($meta.Count -gt 0) {
+            $now=Get-Date
+            $oldestHours=0.0
+            foreach ($p in $meta) {
+                if ($p.LastReplicationSuccess -and $p.LastReplicationSuccess.Year -gt 1900) {
+                    $h=($now - $p.LastReplicationSuccess).TotalHours
+                    if ($h -gt $oldestHours) { $oldestHours=$h }
+                }
+            }
+            if ($oldestHours -lt 1) { $r.maxReplDelayH="$([math]::Round($oldestHours*60,0)) min" }
+            elseif ($oldestHours -lt 48) { $r.maxReplDelayH="$([math]::Round($oldestHours,1)) h" }
+            else { $r.maxReplDelayH="$([math]::Round($oldestHours/24,1)) d" }
+        }
+    } catch {}
 
     # dcdiag (key tests). Parse the dotted result lines with word boundaries so
     # e.g. "Services" doesn't mis-match and report a false failure.
@@ -276,7 +304,7 @@ try {
                     maxReplDelayH    = "$($H.maxReplDelayH)"
                     sysvolReplMethod = if ($H.sysvolShare -eq 'OK') { 'Share OK' } else { "$($H.sysvolShare)" }
                     timeDiff         = if ($H.timeSkew -ne 'N/A') { "$($H.timeSkew)s" } else { 'N/A' }
-                    ntpSource        = 'N/A'
+                    ntpSource        = "$($H.ntpSource)"
                     dcdiag           = $H.dcdiag
                 }
             }
@@ -361,7 +389,297 @@ try {
 if ($SubnetMap.Count -gt 0) { $SubnetsJSON = $SubnetMap | ConvertTo-Json -Compress }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. META
+# 5. REPLICATION HEALTH MATRIX (passive - reads metadata AD already tracks)
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Host "  Building replication health matrix..." -ForegroundColor Yellow
+
+# Enumerate every DC in EVERY domain of the forest (Get-ADDomainController -Filter *
+# on its own only returns the CURRENT domain's DCs).
+$AllDCObjs = @()
+try {
+    $forestDomains = @((Get-ADForest -ErrorAction Stop).Domains)
+} catch {
+    $forestDomains = @()
+}
+if ($forestDomains.Count -eq 0) {
+    try { $forestDomains = @((Get-ADDomain -ErrorAction Stop).DNSRoot) } catch {}
+}
+foreach ($domDNS in $forestDomains) {
+    try { $AllDCObjs += @(Get-ADDomainController -Filter * -Server $domDNS -ErrorAction SilentlyContinue) } catch {}
+}
+$AllDCObjs = @($AllDCObjs | Sort-Object -Property Name -Unique | Sort-Object Site,Name)
+$DCList = @($AllDCObjs | ForEach-Object { [PSCustomObject]@{ short=$_.Name; fqdn=$_.HostName; site=$_.Site } })
+Write-Host "    $($DCList.Count) DC(s) across $($forestDomains.Count) domain(s)" -ForegroundColor DarkGray
+
+# Friendly text for common replication error codes.
+function Get-ReplErrorText {
+    param([int]$code)
+    switch ($code) {
+        0     { 'Success' }
+        5     { 'Access denied' }
+        1256  { 'Remote system not available (target DC unreachable)' }
+        1722  { 'RPC server unavailable (port/firewall blocked or DC down)' }
+        1753  { 'No endpoints available from endpoint mapper (RPC/port issue)' }
+        8451  { 'Replication encountered a database error' }
+        8452  { 'Naming context in process of being removed' }
+        8453  { 'Replication access denied (permissions)' }
+        8456  { 'Source DC currently rejecting replication requests' }
+        8457  { 'Destination DC currently rejecting replication requests' }
+        8461  { 'Replication is blocked until initial sync completes' }
+        8524  { 'DSA operation failed - DNS lookup failure (check DNS/SRV records)' }
+        8545  { 'Replication cannot proceed - schema mismatch' }
+        8606  { 'Insufficient attributes to create object (lingering object)' }
+        8614  { 'Replication has not occurred within the tombstone lifetime' }
+        default { "Replication error $code" }
+    }
+}
+# Short partition label from a naming-context DN.
+function Get-PartitionLabel {
+    param([string]$dn)
+    if (-not $dn) { return '?' }
+    if ($dn -match '^CN=Schema,')        { return 'Schema' }
+    if ($dn -match '^CN=Configuration,')  { return 'Configuration' }
+    if ($dn -match '^DC=ForestDnsZones,') { return 'ForestDnsZones' }
+    if ($dn -match '^DC=DomainDnsZones,') { return 'DomainDnsZones' }
+    if ($dn -match '^DC=') { return (($dn -split ',')[0] -replace 'DC=','') }
+    return (($dn -split ',')[0])
+}
+# Look up a DC's site by its short name (case-insensitive).
+function Get-DCSite {
+    param([string]$short)
+    $m = $DCList | Where-Object { $_.short -eq $short } | Select-Object -First 1
+    if ($m) { return $m.site } else { return '' }
+}
+
+$ReplMatrix = @()          # one row per (source -> destination -> partition)
+$UnknownPartners = @()     # partners reported by AD that are not in $DCList
+$MatrixSourceNote = 'ADWS' # which mechanism produced the data
+
+foreach ($dc in $DCList) {
+    $partners = $null
+    $viaRepadmin = $false
+
+    # Primary path: AD Web Services (TCP 9389). Ask for EVERY partition, not just the
+    # default naming context - Configuration/Schema failures are otherwise invisible.
+    try {
+        $partners = @(Get-ADReplicationPartnerMetadata -Target $dc.fqdn -Scope Server -PartnerType Inbound -Partition * -ErrorAction Stop)
+    } catch {
+        $partners = $null
+    }
+
+    # Fallback: repadmin uses RPC (135 + dynamic), a DIFFERENT path from ADWS. In hardened
+    # networks one often works when the other does not, so try it before giving up.
+    if ($null -eq $partners) {
+        try {
+            $csv = & repadmin /showrepl $dc.fqdn /csv 2>$null
+            if ($LASTEXITCODE -eq 0 -and $csv) {
+                $rows = @($csv | ConvertFrom-Csv | Where-Object { $_.'Showrepl_COLUMNS' -eq 'Showrepl_INFO' })
+                if ($rows.Count -gt 0) {
+                    $partners = @($rows | ForEach-Object {
+                        $ls = $null; $lf = $null
+                        if ($_.'Last Success Time') { try { $ls = [datetime]$_.'Last Success Time' } catch {} }
+                        [PSCustomObject]@{
+                            PartnerShort                  = "$($_.'Source DSA')"
+                            PartitionDN                   = "$($_.'Naming Context')"
+                            LastReplicationSuccess        = $ls
+                            LastReplicationResult         = [int]("0$($_.'Last Failure Status')")
+                            ConsecutiveReplicationFailures= [int]("0$($_.'Number of Failures')")
+                        }
+                    })
+                    $viaRepadmin = $true
+                }
+            }
+        } catch { $partners = $null }
+    }
+
+    if ($null -eq $partners) {
+        # Neither ADWS nor repadmin could read this DC. Its INBOUND partnerships are unknown,
+        # so it is unqueryable as a DESTINATION (its column) - not as a source.
+        $ReplMatrix += [ordered]@{
+            src='(unqueryable)'; dst=$dc.short; srcSite=''; dstSite=$dc.site
+            partition='-'; lastSuccess=''; lastError=1256
+            errorText='Could not read this DC''s replication metadata over ADWS (TCP 9389) or repadmin/RPC. Its inbound replication partnerships are unknown.'
+            failures=0; state='unqueryable'; direction='inbound'
+        }
+        continue
+    }
+
+    foreach ($p in $partners) {
+        # --- source DC short name ---
+        $partnerShort = ''
+        if ($viaRepadmin) {
+            $partnerShort = "$($p.PartnerShort)"
+        } elseif ($p.Partner) {
+            # Partner DN: CN=NTDS Settings,CN=DC02,CN=Servers,CN=<site>,CN=Sites,...
+            if ("$($p.Partner)" -match 'CN=NTDS Settings,CN=([^,]+),') { $partnerShort = $Matches[1] }
+            else { $partnerShort = (("$($p.Partner)" -split ',')[0]) -replace 'CN=','' }
+        }
+        if (-not $partnerShort) { continue }
+
+        # Track partners AD reports that we never enumerated, instead of silently dropping them.
+        if (-not ($DCList | Where-Object { $_.short -eq $partnerShort })) {
+            if ($UnknownPartners -notcontains $partnerShort) { $UnknownPartners += $partnerShort }
+        }
+
+        # --- result code / failures / last success ---
+        $code = 0
+        if ($null -ne $p.LastReplicationResult) { $code = [int]$p.LastReplicationResult }
+        $consecFail = 0
+        if ($null -ne $p.ConsecutiveReplicationFailures) { $consecFail = [int]$p.ConsecutiveReplicationFailures }
+
+        $lastOk = ''
+        $everReplicated = $false
+        if ($p.LastReplicationSuccess -and $p.LastReplicationSuccess.Year -gt 1900) {
+            $lastOk = $p.LastReplicationSuccess.ToString('yyyy-MM-dd HH:mm')
+            $everReplicated = $true
+        }
+
+        # --- partition ---
+        $partDN = if ($viaRepadmin) { "$($p.PartitionDN)" } else { "$($p.Partition)" }
+        $partition = Get-PartitionLabel -dn $partDN
+
+        # --- site-aware delay threshold ---
+        # Intra-site replication runs every ~15s-1min. Inter-site follows the site-link
+        # schedule, whose DEFAULT is 180 minutes - so a flat 3h threshold produced false
+        # "delayed" flags on perfectly healthy inter-site partners.
+        $partnerSite = Get-DCSite -short $partnerShort
+        $sameSite = ($partnerSite -and $partnerSite -eq $dc.site)
+        $delayLimitH = if ($sameSite) { $ReplDelayIntraSiteHours } else { $ReplDelayInterSiteHours }
+
+        $state = 'ok'
+        $errText = Get-ReplErrorText -code $code
+        if ($code -ne 0 -or $consecFail -gt 0) {
+            $state = 'fail'
+        } elseif (-not $everReplicated) {
+            # No error recorded, but replication has never succeeded on this partition.
+            $state = 'fail'
+            $errText = 'No successful replication has ever been recorded for this partition (initial sync may not have completed).'
+        } elseif ($p.LastReplicationSuccess -lt (Get-Date).AddHours(-$delayLimitH)) {
+            $state = 'delayed'
+            $errText = "Last successful replication is older than the $delayLimitH h threshold for a $(if($sameSite){'intra-site'}else{'inter-site'}) partner."
+        }
+
+        $ReplMatrix += [ordered]@{
+            src=$partnerShort; dst=$dc.short; srcSite=$partnerSite; dstSite=$dc.site
+            partition=$partition; lastSuccess=$lastOk; lastError=$code
+            errorText=$errText; failures=$consecFail
+            state=$state; direction='inbound'; via=$(if($viaRepadmin){'repadmin'}else{'ADWS'})
+        }
+    }
+    if ($viaRepadmin) { $MatrixSourceNote = 'ADWS + repadmin fallback' }
+}
+
+# Any partner AD reported that we did not enumerate still deserves a row/column.
+foreach ($u in $UnknownPartners) {
+    if (-not ($DCList | Where-Object { $_.short -eq $u })) {
+        $DCList += [PSCustomObject]@{ short=$u; fqdn=$u; site='(not enumerated)' }
+        Write-Host "    note: partner '$u' was reported by AD but is not an enumerated DC - added to the matrix" -ForegroundColor DarkYellow
+    }
+}
+
+$ReplMeta = [ordered]@{
+    via              = $MatrixSourceNote
+    partitionsChecked= 'all (domain, configuration, schema, DNS zones)'
+    intraSiteDelayH  = $ReplDelayIntraSiteHours
+    interSiteDelayH  = $ReplDelayInterSiteHours
+    domains          = $forestDomains.Count
+}
+$ReplMatrixJSON = if ($ReplMatrix.Count -gt 0) { ConvertTo-Json -InputObject @($ReplMatrix) -Depth 5 -Compress } else { '[]' }
+$DCListJSON     = if ($DCList.Count -gt 0) { ConvertTo-Json -InputObject @($DCList) -Depth 3 -Compress } else { '[]' }
+$ReplMetaJSON   = ConvertTo-Json -InputObject $ReplMeta -Compress
+Write-Host "    $($ReplMatrix.Count) partnership/partition record(s) across $($DCList.Count) DC(s)" -ForegroundColor DarkGray
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. STALE / LINGERING OBJECTS (passive - scans Configuration + Sites & Services)
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Host "  Scanning for stale / lingering objects..." -ForegroundColor Yellow
+$StaleFindings = @()   # {category, severity, name, detail, dn, remediation}
+try {
+    $cfgNC   = (Get-ADRootDSE -ErrorAction Stop).configurationNamingContext
+    $liveDCNames = @($AllDCObjs | ForEach-Object { $_.Name })
+    $allSites = @(Get-ADReplicationSite -Filter * -ErrorAction SilentlyContinue)
+    $allSubnets = @(Get-ADReplicationSubnet -Filter * -Properties Site -ErrorAction SilentlyContinue)
+
+    # a) Orphaned NTDS Settings / server objects (server object with no live DC)
+    try {
+        $serverObjs = @(Get-ADObject -SearchBase "CN=Sites,$cfgNC" -LDAPFilter '(objectClass=server)' -Properties name,distinguishedName -ErrorAction SilentlyContinue)
+        foreach ($so in $serverObjs) {
+            if ($liveDCNames -notcontains $so.name) {
+                $siteName = if ($so.distinguishedName -match 'CN=Servers,CN=([^,]+),CN=Sites') { $Matches[1] } else { '?' }
+                $StaleFindings += [ordered]@{
+                    category='Orphaned DC metadata'; severity='high'; name=$so.name
+                    detail="Server object in site '$siteName' has no matching live domain controller."
+                    dn=$so.distinguishedName
+                    remediation="Verify the DC is truly decommissioned, then run: ntdsutil metadata cleanup (or remove via AD Sites &amp; Services)."
+                }
+            }
+        }
+    } catch {}
+
+    # b) Empty sites (no DCs)
+    foreach ($site in $allSites) {
+        $dcInSite = @($AllDCObjs | Where-Object { $_.Site -eq $site.Name })
+        if ($dcInSite.Count -eq 0) {
+            $StaleFindings += [ordered]@{
+                category='Empty site'; severity='medium'; name=$site.Name
+                detail="Site has no domain controllers."
+                dn="$($site.DistinguishedName)"
+                remediation="If the site is no longer used, remove it (and its subnets/site links). If intentional (e.g. a client-only site), no action needed."
+            }
+        }
+    }
+
+    # c) Sites with no subnets
+    foreach ($site in $allSites) {
+        $subForSite = @($allSubnets | Where-Object { "$($_.Site)" -match "CN=$([regex]::Escape($site.Name))," })
+        if ($subForSite.Count -eq 0) {
+            $StaleFindings += [ordered]@{
+                category='Site without subnets'; severity='low'; name=$site.Name
+                detail="Site has no associated subnets - clients may not map to it correctly."
+                dn="$($site.DistinguishedName)"
+                remediation="Associate the correct IP subnet(s) with this site in AD Sites &amp; Services."
+            }
+        }
+    }
+
+    # d) Unlinked subnets (subnet with no site)
+    foreach ($sn in $allSubnets) {
+        if (-not $sn.Site) {
+            $StaleFindings += [ordered]@{
+                category='Unlinked subnet'; severity='low'; name=$sn.Name
+                detail="Subnet is not associated with any site."
+                dn="$($sn.DistinguishedName)"
+                remediation="Assign this subnet to the appropriate site, or remove it if obsolete."
+            }
+        }
+    }
+
+    # e) Lingering connection objects (NTDS connection whose 'fromServer' points to a dead server)
+    try {
+        $connObjs = @(Get-ADObject -SearchBase "CN=Sites,$cfgNC" -LDAPFilter '(objectClass=nTDSConnection)' -Properties fromServer,distinguishedName -ErrorAction SilentlyContinue)
+        foreach ($co in $connObjs) {
+            if ($co.fromServer -and $co.fromServer -match 'CN=NTDS Settings,CN=([^,]+),') {
+                $fromDC = $Matches[1]
+                if ($liveDCNames -notcontains $fromDC) {
+                    $StaleFindings += [ordered]@{
+                        category='Lingering replication connection'; severity='medium'; name="from $fromDC"
+                        detail="A replication connection object references source server '$fromDC', which is not a live DC."
+                        dn="$($co.distinguishedName)"
+                        remediation="Remove the stale connection object; the KCC will rebuild valid connections automatically."
+                    }
+                }
+            }
+        }
+    } catch {}
+
+} catch {
+    Write-Host "    Stale-object scan limited: $($_.Exception.Message)" -ForegroundColor DarkYellow
+}
+$StaleJSON = if ($StaleFindings.Count -gt 0) { ConvertTo-Json -InputObject @($StaleFindings) -Depth 5 -Compress } else { '[]' }
+Write-Host "    $($StaleFindings.Count) stale/lingering finding(s)" -ForegroundColor DarkGray
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. META
 # ─────────────────────────────────────────────────────────────────────────────
 $ForestName = try { (Get-ADForest -ErrorAction Stop).Name } catch { "Active Directory" }
 
@@ -378,6 +696,7 @@ $HTML = @"
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AD Infrastructure Topology &mdash; $ForestName</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg:#0d1117; --surface:#161b22; --surface2:#21262d; --border:#30363d;
@@ -387,14 +706,24 @@ $HTML = @"
   --forest-c:#388bfd; --domain-c:#3fb950; --site-c:#8b949e;
 }
 [data-theme="light"] {
-  --bg:#f6f8fa; --surface:#fff; --surface2:#f0f3f6; --border:#d0d7de;
-  --text:#1f2328; --muted:#636c76;
-  --blue:#0969da; --green:#1a7f37; --yellow:#9a6700; --red:#d1242f;
-  --purple:#8250df; --teal:#0d8a7d;
-  --forest-c:#0969da; --domain-c:#1a7f37; --site-c:#57606a;
+  --bg:#f5f6fb; --surface:#ffffff; --surface2:#eef1f9; --surface3:#dfe4f2; --border:#e4e7f2; --text:#161a2e; --muted:#64708c;
+  --accent:#4f46e5; --accent-2:#6366f1; --accent-soft:#e6e6fd; --navy:#3730a3; --violet:#6d28d9; --fuchsia:#c026d3;
+  --green:#059669; --green-soft:#d1fae5; --red:#dc2626; --red-soft:#fde2e2; --amber:#d97706; --amber-soft:#fef3c7; --yellow:#d97706;
+  --blue:#2563eb; --blue-soft:#dbe8fe; --teal:#0d9488; --teal-soft:#cdeee9; --purple:#7c3aed; --purple-soft:#ede9fe; --pink:#db2777; --pink-soft:#fce7f3; --cyan:#0891b2; --cyan-soft:#cffafe;
+  --forest-c:#4f46e5; --domain-c:#059669; --site-c:#5b6b8c;
+  --radius:13px; --radius-sm:9px;
+  --shadow:0 2px 8px rgb(60 50 140 / 0.06), 0 1px 2px rgb(60 50 140 / 0.04);
+  --shadow-hover:0 9px 26px rgb(60 50 140 / 0.14);
+  --font:'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --mono:'SFMono-Regular', ui-monospace, Menlo, Consolas, monospace;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column;overflow:hidden}
+body{font-family:'Inter',system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.topo-view{height:calc(100vh - 48px);display:flex;flex-direction:column;position:relative}
+.scrolldown{position:absolute;bottom:46px;left:50%;transform:translateX(-50%);z-index:60;display:flex;flex-direction:column;align-items:center;gap:2px;background:var(--surface);border:1px solid var(--border);color:var(--accent,var(--forest-c));border-radius:22px;padding:7px 16px;cursor:pointer;font-size:11px;font-weight:600;box-shadow:var(--shadow,0 4px 14px rgba(0,0,0,.12));transition:transform .15s ease,box-shadow .15s ease}
+.scrolldown:hover{transform:translateX(-50%) translateY(2px);box-shadow:var(--shadow-hover,0 8px 22px rgba(0,0,0,.18))}
+.scrolldown i{font-size:15px;animation:bob 1.6s ease-in-out infinite}
+@keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(3px)}}
 .topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:8px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:sticky;top:0;z-index:100;min-height:48px}
 .brand{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700;color:var(--text);white-space:nowrap}
 .brand i{color:var(--blue);font-size:17px}
@@ -409,9 +738,9 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 .btn.on{background:var(--blue);border-color:var(--blue);color:#fff}
 .btn.grn{border-color:var(--green);color:var(--green)}.btn.grn:hover{background:var(--green);color:#fff}
 .meta{font-size:10px;color:var(--muted);margin-left:auto;white-space:nowrap}
-.cw{flex:1;position:relative;overflow:hidden;cursor:grab}
+.cw{flex:1;position:relative;overflow:hidden;cursor:grab;margin:0 56px;border:1px solid var(--border);border-radius:12px;background:var(--surface);box-shadow:var(--shadow)}
 .cw.drag{cursor:grabbing}
-.grid-bg{position:absolute;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:40px 40px;opacity:.18;pointer-events:none}
+.grid-bg{position:absolute;inset:0;border-radius:12px;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:40px 40px;opacity:.18;pointer-events:none}
 #replSvg{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:5}
 .cc{position:absolute;top:0;left:0;transform-origin:0 0;padding:50px;display:flex;flex-direction:column;gap:50px}
 .fb{position:relative;border:2px solid var(--forest-c);border-radius:14px;background:color-mix(in srgb,var(--forest-c) 5%,var(--surface));padding:44px 28px 28px;min-width:400px}
@@ -440,7 +769,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 .sh-name{font-size:10px;font-weight:700;color:#fff}
 .sbody{padding:10px}
 .subnets{font-size:9px;color:var(--muted);margin-bottom:8px;font-family:monospace;line-height:1.5;max-height:48px;overflow:hidden}
-.subnet-more{color:var(--blue);font-weight:700;font-family:'Segoe UI',sans-serif}
+.subnet-more{color:var(--blue);font-weight:700;font-family:'Inter',sans-serif}
 .dcgrid{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-start}
 .dcc{position:relative;width:78px;display:flex;flex-direction:column;align-items:center;gap:3px;padding:7px 5px;border-radius:7px;background:var(--surface);border:1px solid var(--border);cursor:pointer;transition:all .18s}
 .dcc:hover{border-color:var(--blue);transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.3)}
@@ -506,12 +835,62 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 .lsq{width:10px;height:10px;border-radius:2px}
 .ltt{position:fixed;background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:7px 11px;font-size:10px;color:var(--text);pointer-events:none;z-index:300;display:none;max-width:210px;line-height:1.6}
 .ltt.on{display:block}
+/* Analysis sections below the topology */
+.analysis{background:var(--bg);border-top:3px solid var(--border);padding:8px 26px 60px}
+.asec{max-width:1200px;margin:0 auto;padding:26px 0;border-bottom:1px solid var(--border)}
+.asec:last-child{border-bottom:none}
+.asec-h{font-size:17px;font-weight:800;display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.asec-h i{color:var(--accent,var(--forest-c))}
+.rmsub{font-size:12px;color:var(--muted);margin-bottom:16px;line-height:1.6}
+.rmsub code{background:var(--surface2);padding:1px 6px;border-radius:4px;font-size:11px}
+/* summary chips */
+.rchips{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}
+.rchip{background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:9px 14px;min-width:96px}
+.rchip .n{font-size:19px;font-weight:800}.rchip .l{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+.rchip.g .n{color:var(--green)}.rchip.a .n{color:var(--yellow)}.rchip.r .n{color:var(--red)}
+/* matrix */
+.mwrap{overflow:auto;border:1px solid var(--border);border-radius:10px;background:var(--surface)}
+table.mtx{border-collapse:collapse;font-size:11px;width:100%}
+table.mtx th,table.mtx td{border:1px solid var(--border);padding:0;text-align:center}
+table.mtx thead th{background:var(--surface2);padding:7px 6px;font-weight:600;white-space:nowrap;position:sticky;top:0;z-index:2}
+table.mtx tbody th{background:var(--surface2);padding:7px 10px;text-align:left;font-weight:600;white-space:nowrap;position:sticky;left:0;z-index:1}
+.mcell{width:100%;min-width:34px;height:32px;display:flex;align-items:center;justify-content:center;cursor:default;font-size:12px}
+.mcell.ok{background:color-mix(in srgb,var(--green) 18%,transparent);color:var(--green)}
+.mcell.delayed{background:color-mix(in srgb,var(--yellow) 20%,transparent);color:var(--yellow);cursor:pointer}
+.mcell.fail{background:color-mix(in srgb,var(--red) 20%,transparent);color:var(--red);cursor:pointer;font-weight:700}
+.mcell.unq{background:color-mix(in srgb,var(--red) 12%,transparent);color:var(--red);cursor:pointer}
+.mcell.none{color:var(--border)}
+.mcell.self{background:repeating-linear-gradient(45deg,var(--surface2),var(--surface2) 4px,var(--surface) 4px,var(--surface) 8px)}
+table.mtx thead th.unq-col{background:color-mix(in srgb,var(--red) 10%,var(--surface2));border-bottom:3px solid var(--red);color:var(--red)}
+.unq-badge{display:block;margin-top:3px;padding:1px 7px;font-size:8px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;background:var(--red);color:#fff;border-radius:20px;cursor:pointer}
+.unq-badge:hover{filter:brightness(1.08)}
+.mlabel{font-size:9px;color:var(--muted);margin:2px 0 12px}
+table.pt{width:100%;border-collapse:collapse;font-size:11px;margin-top:10px;background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+table.pt th,table.pt td{border-bottom:1px solid var(--border);padding:6px 10px;text-align:left;vertical-align:top}
+table.pt thead th{background:var(--surface2);font-weight:600;color:var(--muted);text-transform:uppercase;font-size:9px;letter-spacing:.04em}
+table.pt tbody tr:last-child td{border-bottom:none}
+/* stale cards */
+.scard{border:1px solid var(--border);border-left-width:3px;border-radius:9px;padding:12px 15px;margin-bottom:10px;background:var(--surface)}
+.scard.high{border-left-color:var(--red)}.scard.medium{border-left-color:var(--yellow)}.scard.low{border-left-color:var(--muted)}
+.scard-h{display:flex;align-items:center;gap:9px;margin-bottom:5px}
+.scard-cat{font-weight:700;font-size:13px}
+.sev{font-size:9px;text-transform:uppercase;letter-spacing:.04em;padding:2px 7px;border-radius:20px;font-weight:600}
+.sev.high{background:color-mix(in srgb,var(--red) 16%,transparent);color:var(--red)}
+.sev.medium{background:color-mix(in srgb,var(--yellow) 18%,transparent);color:var(--yellow)}
+.sev.low{background:var(--surface2);color:var(--muted)}
+.scard-name{font-family:var(--mono,monospace);font-size:12px;color:var(--accent,var(--forest-c));margin-bottom:3px}
+.scard-det{font-size:12px;color:var(--text);line-height:1.5;margin-bottom:6px}
+.scard-dn{font-family:var(--mono,monospace);font-size:10px;color:var(--muted);word-break:break-all;margin-bottom:6px}
+.scard-fix{font-size:11px;color:var(--muted);background:var(--surface2);border-radius:6px;padding:7px 10px;line-height:1.5}
+.scard-fix b{color:var(--text)}
+.rempty{text-align:center;padding:40px 20px;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:10px}
+.rempty i{font-size:36px;color:var(--green);display:block;margin-bottom:12px}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--surface2)}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 </style>
 </head>
-<body data-theme="dark">
+<body data-theme="light">
 
 <div class="topbar">
   <div class="brand"><i class="bi bi-diagram-3-fill"></i>AD Infrastructure Topology</div>
@@ -538,6 +917,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   <div class="meta">Forest: $ForestName &nbsp;|&nbsp; $GeneratedAt</div>
 </div>
 
+<div class="topo-view">
 <div class="cw" id="cw">
   <div class="grid-bg"></div>
   <svg id="replSvg"></svg>
@@ -554,7 +934,20 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   <div class="li"><div class="ld" style="background:var(--green)"></div>Healthy</div>
   <div class="li"><div class="ld" style="background:var(--yellow)"></div>Warning &nbsp;<small>(&#10227; dot = pending reboot)</small></div>
   <div class="li"><div class="ld" style="background:var(--red)"></div>Critical &nbsp;<small>(&#9679; dot = NTLMv1)</small></div>
-  <span style="margin-left:auto;font-size:10px;color:var(--muted)">Click any DC for full details</span>
+  <span style="margin-left:auto;font-size:10px;color:var(--muted)">Click any DC for full details &middot; scroll down for analysis</span>
+</div>
+<div class="scrolldown" onclick="document.getElementById('sec-repl').scrollIntoView({behavior:'smooth'})" title="Jump to analysis sections"><i class="bi bi-chevron-double-down"></i>Analysis below</div>
+</div>
+
+<div class="analysis">
+  <section class="asec" id="sec-repl">
+    <h2 class="asec-h"><i class="bi bi-grid-3x3-gap"></i> Replication Health Matrix</h2>
+    <div id="replBody"></div>
+  </section>
+  <section class="asec" id="sec-stale">
+    <h2 class="asec-h"><i class="bi bi-trash3"></i> Stale / Lingering Objects</h2>
+    <div id="staleBody"></div>
+  </section>
 </div>
 
 <div class="overlay" id="ov" onclick="closePanel()"></div>
@@ -573,6 +966,10 @@ const topo      = $TopologyJSON;
 const siteLinks = $SiteLinksJSON;
 const replIssues= $ReplJSON;
 const subnetMap = $SubnetsJSON;
+const replMatrix = $ReplMatrixJSON;
+const replMeta   = $ReplMetaJSON;
+const dcList     = $DCListJSON;
+const staleObjects = $StaleJSON;
 
 // PowerShell's ConvertTo-Json collapses single-element arrays into scalars.
 // Normalise the shape so the renderer can always rely on arrays being arrays.
@@ -1029,6 +1426,9 @@ cw.addEventListener('mousedown',e=>{
 window.addEventListener('mousemove',e=>{if(!dragging)return;TX=e.clientX-dsx;TY=e.clientY-dsy;applyT();});
 window.addEventListener('mouseup',()=>{dragging=false;cw.classList.remove('drag');});
 cw.addEventListener('wheel',e=>{
+  // If already fully zoomed out and the user keeps scrolling down, let the page
+  // scroll to the analysis sections instead of trapping the wheel.
+  if(e.deltaY>0 && Z<=0.2){ return; }
   e.preventDefault();
   const r=cw.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,prev=Z;
   Z=Math.min(Math.max(Z-e.deltaY*.001,.2),3);
@@ -1039,7 +1439,172 @@ function toggleTheme(){
   document.body.setAttribute('data-theme',document.body.getAttribute('data-theme')==='dark'?'light':'dark');
 }
 
+// ============ Analysis sections: replication matrix / ports / stale objects ============
+function esc(s){ return (''+(s==null?'':s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function renderAnalysis(){
+  document.getElementById('replBody').innerHTML = buildReplMatrix();
+  document.getElementById('staleBody').innerHTML = buildStale();
+}
+
+// ---- Replication matrix ----
+function buildReplMatrix(){
+  const dcs=(Array.isArray(dcList)?dcList:[]).map(d=>d.short);
+  const M=Array.isArray(replMatrix)?replMatrix:[];
+  const meta=(typeof replMeta!=='undefined'&&replMeta)?replMeta:{};
+  if(!dcs.length){ return '<div class="rempty"><i class="bi bi-info-circle"></i>No domain controllers were enumerated.</div>'; }
+
+  // AD reports one record per (source, destination, PARTITION). Aggregate them into one
+  // cell per DC pair, with the WORST partition state winning, and keep the per-partition
+  // breakdown for the detail card. A pair that is fine on the domain NC but failing on
+  // Configuration or Schema must NOT render as healthy.
+  const RANK={ok:0,delayed:1,fail:2};
+  const pairs={};      // "src|dst" -> { src,dst,state,parts:[] }
+  const unqDst={};     // destination DC -> marker row (its inbound partners are unknown)
+  M.forEach(r=>{
+    if(r.state==='unqueryable' || r.src==='(unqueryable)'){ unqDst[r.dst]=r; return; }
+    if(r.dst==='(all partners)'){ unqDst[r.src]=r; return; }   // back-compat with older reports
+    const k=r.src+'|'+r.dst;
+    if(!pairs[k]) pairs[k]={src:r.src,dst:r.dst,state:r.state,parts:[]};
+    pairs[k].parts.push(r);
+    if((RANK[r.state]||0) > (RANK[pairs[k].state]||0)) pairs[k].state=r.state;
+  });
+
+  const pairList=Object.values(pairs);
+  let ok=0,delayed=0,fail=0;
+  pairList.forEach(p=>{ if(p.state==='ok')ok++; else if(p.state==='delayed')delayed++; else fail++; });
+  const unqCount=Object.keys(unqDst).length;
+
+  let h='<div class="rmsub">Each cell is a directional replication partnership: <b>row&nbsp;&rarr;&nbsp;column</b> (source replicates to destination). '
+    +'Read from the metadata AD already tracks &mdash; no network probing. Every naming context is checked '
+    +'(domain, Configuration, Schema, DNS zones); a cell shows the <b>worst</b> partition, so a pair that is healthy on the domain NC '
+    +'but failing on Configuration still shows as failing. Click any cell for the full partition breakdown. '
+    +'Grey cells mean the KCC built no direct connection for that pair (normal).'
+    +(unqCount>0 ? ' <b>Unqueryable</b> columns are DCs whose own metadata could not be read, so their <i>inbound</i> partnerships are unknown &mdash; their outbound rows may still show valid data reported by other DCs.' : '')
+    +'</div>';
+
+  h+='<div class="rchips">'
+    +'<div class="rchip"><div class="n">'+dcs.length+'</div><div class="l">DCs</div></div>'
+    +'<div class="rchip"><div class="n">'+pairList.length+'</div><div class="l">Partnerships</div></div>'
+    +'<div class="rchip g"><div class="n">'+ok+'</div><div class="l">Healthy</div></div>'
+    +'<div class="rchip a"><div class="n">'+delayed+'</div><div class="l">Delayed</div></div>'
+    +'<div class="rchip r"><div class="n">'+fail+'</div><div class="l">Failing</div></div>'
+    +(unqCount>0 ? '<div class="rchip r"><div class="n">'+unqCount+'</div><div class="l">Unqueryable DCs</div></div>' : '')
+    +'</div>';
+
+  if(meta.via){
+    h+='<div class="mlabel">source: '+esc(meta.via)+' &middot; partitions: all &middot; delay thresholds: '
+      +esc(meta.intraSiteDelayH)+'h intra-site, '+esc(meta.interSiteDelayH)+'h inter-site</div>';
+  }
+  h+='<div class="mlabel">rows = source DC&nbsp; &rarr; &nbsp;columns = destination DC</div>';
+  h+='<div class="mwrap"><table class="mtx"><thead><tr><th>src &rarr; dst</th>';
+  dcs.forEach(d=>{
+    const unq=!!unqDst[d];
+    h+='<th'+(unq?' class="unq-col"':'')+'>'+esc(d)
+      +(unq?'<div class="unq-badge" title="Click for details" onclick="replCellInfo(\'(unqueryable)\',\''+esc(d)+'\')">unqueryable</div>':'')
+      +'</th>';
+  });
+  h+='</tr></thead><tbody>';
+  dcs.forEach(src=>{
+    h+='<tr><th>'+esc(src)+'</th>';
+    dcs.forEach(dst=>{
+      if(src===dst){ h+='<td><div class="mcell self"></div></td>'; return; }
+      const p=pairs[src+'|'+dst];
+      if(p){
+        let ic='&check;'; if(p.state==='fail'){ic='&times;';} else if(p.state==='delayed'){ic='!';}
+        const bad=p.parts.filter(x=>x.state!=='ok');
+        const tip=esc(src+' \u2192 '+dst+' | '+p.parts.length+' partition(s)'
+          +(bad.length?(' | issue on: '+bad.map(x=>x.partition).join(', ')):' | all healthy'));
+        h+='<td><div class="mcell '+p.state+'" title="'+tip+'" onclick="replCellInfo(\''+esc(src)+'\',\''+esc(dst)+'\')">'+ic+'</div></td>';
+        return;
+      }
+      if(unqDst[dst]){
+        h+='<td><div class="mcell unq" title="'+esc(dst+' metadata could not be read - inbound partnerships unknown')+'" onclick="replCellInfo(\'(unqueryable)\',\''+esc(dst)+'\')">?</div></td>';
+        return;
+      }
+      h+='<td><div class="mcell none">&middot;</div></td>';
+    });
+    h+='</tr>';
+  });
+  h+='</tbody></table></div>';
+  h+='<div id="replCellDetail" style="margin-top:16px"></div>';
+  return h;
+}
+function replCellInfo(src,dst){
+  const M=Array.isArray(replMatrix)?replMatrix:[];
+  const el=document.getElementById('replCellDetail');
+  if(!el) return;
+  // Unqueryable destination: find the marker row for this DC (new or legacy shape)
+  if(src==='(unqueryable)'){
+    const u=M.find(r=>(r.state==='unqueryable'&&r.dst===dst)||(r.dst==='(all partners)'&&r.src===dst));
+    if(!u) return;
+    el.innerHTML='<div class="scard high">'
+      +'<div class="scard-h"><span class="scard-cat">'+esc(dst)+'</span>'
+      +'<span class="sev high">unqueryable</span></div>'
+      +'<div class="scard-det">This DC\'s own replication metadata could not be read, so its <b>inbound</b> replication partnerships are unknown. '
+      +'Any healthy cells in its row were reported by <i>other</i> DCs and are still valid.</div>'
+      +'<div class="scard-fix"><b>Error '+u.lastError+':</b> '+esc(u.errorText)
+      +'<br><br><b>Common causes:</b> the DC is down; <b>ADWS (TCP 9389)</b> is blocked or the Active Directory Web Services service is not running on it; '
+      +'RPC (135 + dynamic range) is also blocked, so the repadmin fallback could not reach it either &mdash; Azure NSGs and hardened firewalls commonly block both; '
+      +'or the account running this script lacks rights on that DC.</div></div>';
+    return;
+  }
+  const rows=M.filter(r=>r.src===src&&r.dst===dst);
+  if(!rows.length) return;
+  const RANK={ok:0,delayed:1,fail:2};
+  let worst='ok'; rows.forEach(r=>{ if((RANK[r.state]||0)>(RANK[worst]||0)) worst=r.state; });
+  const sev=(worst==='ok')?'low':((worst==='delayed')?'medium':'high');
+  let t='<table class="pt"><thead><tr><th>Partition</th><th>State</th><th>Last success</th><th>Failures</th><th>Result</th></tr></thead><tbody>';
+  rows.forEach(r=>{
+    t+='<tr><td><b>'+esc(r.partition)+'</b></td>'
+      +'<td><span class="sev '+(r.state==='ok'?'low':(r.state==='delayed'?'medium':'high'))+'">'+esc(r.state)+'</span></td>'
+      +'<td>'+(r.lastSuccess?esc(r.lastSuccess):'&mdash;')+'</td>'
+      +'<td>'+(r.failures||0)+'</td>'
+      +'<td>'+(r.lastError?('<b>'+r.lastError+'</b> '+esc(r.errorText)):esc(r.errorText||'Success'))+'</td></tr>';
+  });
+  t+='</tbody></table>';
+  el.innerHTML='<div class="scard '+sev+'">'
+    +'<div class="scard-h"><span class="scard-cat">'+esc(src)+' &rarr; '+esc(dst)+'</span>'
+    +'<span class="sev '+sev+'">'+esc(worst)+'</span></div>'
+    +'<div class="scard-det">'+rows.length+' naming context(s) replicate over this partnership. The cell colour reflects the worst one.</div>'
+    +t+'</div>';
+}
+
+// ---- Stale objects ----
+function buildStale(){
+  const F=Array.isArray(staleObjects)?staleObjects:[];
+  if(!F.length){
+    return '<div class="rempty"><i class="bi bi-check-circle-fill"></i>No stale or lingering objects found.<br>'
+      +'<span style="font-size:12px">Configuration, Sites &amp; Services, and DC metadata all look clean.</span></div>';
+  }
+  const sev={high:0,medium:0,low:0};
+  F.forEach(f=>{ sev[f.severity]=(sev[f.severity]||0)+1; });
+  let h='<div class="rmsub">Read-only scan of the Configuration partition and Sites &amp; Services for leftover infrastructure objects. '
+    +'Nothing is modified &mdash; each finding lists the recommended remediation.</div>';
+  h+='<div class="rchips">'
+    +'<div class="rchip r"><div class="n">'+(sev.high||0)+'</div><div class="l">High</div></div>'
+    +'<div class="rchip a"><div class="n">'+(sev.medium||0)+'</div><div class="l">Medium</div></div>'
+    +'<div class="rchip"><div class="n">'+(sev.low||0)+'</div><div class="l">Low</div></div>'
+    +'</div>';
+  // group by category
+  const cats={};
+  F.forEach(f=>{ (cats[f.category]=cats[f.category]||[]).push(f); });
+  Object.keys(cats).forEach(cat=>{
+    h+='<div style="font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:700;margin:16px 0 8px">'+esc(cat)+' ('+cats[cat].length+')</div>';
+    cats[cat].forEach(f=>{
+      h+='<div class="scard '+esc(f.severity)+'">'
+        +'<div class="scard-h"><span class="scard-cat">'+esc(f.name)+'</span><span class="sev '+esc(f.severity)+'">'+esc(f.severity)+'</span></div>'
+        +'<div class="scard-det">'+esc(f.detail)+'</div>'
+        +(f.dn?('<div class="scard-dn">'+esc(f.dn)+'</div>'):'')
+        +'<div class="scard-fix"><b>Remediation:</b> '+f.remediation+'</div>'
+        +'</div>';
+    });
+  });
+  return h;
+}
+
 renderAll();
+renderAnalysis();
 </script>
 </body>
 </html>

@@ -68,7 +68,8 @@ Write-Host "[1/4] Collecting forest facts..." -ForegroundColor Yellow
 $SchemaVersionMap = @{
     13='Windows 2000'; 30='Windows Server 2003'; 31='Windows Server 2003 R2'
     44='Windows Server 2008'; 47='Windows Server 2008 R2'; 56='Windows Server 2012'
-    69='Windows Server 2012 R2'; 87='Windows Server 2016'; 88='Windows Server 2019/2022'
+    69='Windows Server 2012 R2'; 87='Windows Server 2016'; 88='Windows Server 2019 / 2022'
+    91='Windows Server 2025'
 }
 $SchemaVersion = $null; $SchemaName = 'Unknown'
 try {
@@ -148,26 +149,58 @@ $OsAgg = @{}
 $CompEnabled=0; $CompDisabled=0; $CompStale=0; $ServerCount=0; $ClientCount=0
 $GrpSecurity=0; $GrpDistribution=0; $GrpGlobal=0; $GrpDomainLocal=0; $GrpUniversal=0
 
+# Full object lists for CSV export (Name / SamAccountName / Enabled / LastLogon / DN)
+$ListUserEnabled=[System.Collections.Generic.List[object]]::new()
+$ListUserDisabled=[System.Collections.Generic.List[object]]::new()
+$ListUserStale=[System.Collections.Generic.List[object]]::new()
+$ListUserNeverLogged=[System.Collections.Generic.List[object]]::new()
+$ListUserLocked=[System.Collections.Generic.List[object]]::new()
+$ListUserPwdNeverExp=[System.Collections.Generic.List[object]]::new()
+$ListCompEnabled=[System.Collections.Generic.List[object]]::new()
+$ListCompDisabled=[System.Collections.Generic.List[object]]::new()
+$ListCompStale=[System.Collections.Generic.List[object]]::new()
+$ListCompServers=[System.Collections.Generic.List[object]]::new()
+$ListCompClients=[System.Collections.Generic.List[object]]::new()
+$ListGrpSecurity=[System.Collections.Generic.List[object]]::new()
+$ListGrpDistribution=[System.Collections.Generic.List[object]]::new()
+$ListGrpGlobal=[System.Collections.Generic.List[object]]::new()
+$ListGrpDomainLocal=[System.Collections.Generic.List[object]]::new()
+$ListGrpUniversal=[System.Collections.Generic.List[object]]::new()
+
+function New-ObjRow {
+    param($obj, $enabled)
+    $ll = if ($obj.LastLogonDate) { $obj.LastLogonDate.ToString('yyyy-MM-dd HH:mm') } else { '' }
+    [PSCustomObject]@{
+        Name          = "$($obj.Name)"
+        SamAccountName= "$($obj.SamAccountName)"
+        Enabled       = if ($enabled) { 'True' } else { 'False' }
+        LastLogon     = $ll
+        DN            = "$($obj.DistinguishedName)"
+    }
+}
+
 foreach ($domName in $Forest.Domains) {
     # Users
     try {
         $users = Get-ADUser -Filter * -Server $domName -Properties Enabled,LastLogonDate,PasswordNeverExpires,LockedOut -ResultSetSize $null
         foreach ($u in $users) {
-            if ($u.Enabled) { $AcctEnabled++ } else { $AcctDisabled++ }
-            if ($u.Enabled -and $u.LastLogonDate -and $u.LastLogonDate -lt $StaleCutoff) { $AcctStale++ }
-            if ($u.Enabled -and -not $u.LastLogonDate) { $AcctNeverLoggedOn++ }
-            if ($u.LockedOut) { $AcctLocked++ }
-            if ($u.Enabled -and $u.PasswordNeverExpires) { $AcctPwdNeverExp++ }
+            $row = New-ObjRow -obj $u -enabled $u.Enabled
+            if ($u.Enabled) { $AcctEnabled++; $ListUserEnabled.Add($row) } else { $AcctDisabled++; $ListUserDisabled.Add($row) }
+            if ($u.Enabled -and $u.LastLogonDate -and $u.LastLogonDate -lt $StaleCutoff) { $AcctStale++; $ListUserStale.Add($row) }
+            if ($u.Enabled -and -not $u.LastLogonDate) { $AcctNeverLoggedOn++; $ListUserNeverLogged.Add($row) }
+            if ($u.LockedOut) { $AcctLocked++; $ListUserLocked.Add($row) }
+            if ($u.Enabled -and $u.PasswordNeverExpires) { $AcctPwdNeverExp++; $ListUserPwdNeverExp.Add($row) }
         }
     } catch {}
     # Computers + OS
     try {
         $comps = Get-ADComputer -Filter * -Server $domName -Properties Enabled,LastLogonDate,OperatingSystem -ResultSetSize $null
         foreach ($c in $comps) {
-            if ($c.Enabled) { $CompEnabled++ } else { $CompDisabled++ }
-            if ($c.Enabled -and $c.LastLogonDate -and $c.LastLogonDate -lt $StaleCutoff) { $CompStale++ }
+            $row = New-ObjRow -obj $c -enabled $c.Enabled
+            if ($c.Enabled) { $CompEnabled++; $ListCompEnabled.Add($row) } else { $CompDisabled++; $ListCompDisabled.Add($row) }
+            if ($c.Enabled -and $c.LastLogonDate -and $c.LastLogonDate -lt $StaleCutoff) { $CompStale++; $ListCompStale.Add($row) }
             $os = if ($c.OperatingSystem) { $c.OperatingSystem } else { '(unknown)' }
-            if ($os -match 'Server') { $ServerCount++ } elseif ($os -ne '(unknown)') { $ClientCount++ }
+            if ($os -match 'Server') { $ServerCount++; $ListCompServers.Add($row) } elseif ($os -ne '(unknown)') { $ClientCount++; $ListCompClients.Add($row) }
             $osKey = $os -replace 'Windows Server','WS' -replace 'Windows','Win' -replace '\s+',' '
             $osKey = $osKey.Trim()
             if (-not $OsAgg.ContainsKey($osKey)) { $OsAgg[$osKey]=0 }
@@ -178,11 +211,18 @@ foreach ($domName in $Forest.Domains) {
     try {
         $groups = Get-ADGroup -Filter * -Server $domName -Properties GroupCategory,GroupScope -ResultSetSize $null
         foreach ($g in $groups) {
-            if ("$($g.GroupCategory)" -eq 'Security') { $GrpSecurity++ } else { $GrpDistribution++ }
+            $grow = [PSCustomObject]@{
+                Name           = "$($g.Name)"
+                SamAccountName = "$($g.SamAccountName)"
+                Enabled        = "$($g.GroupCategory)"   # for groups: category (Security/Distribution)
+                LastLogon      = "$($g.GroupScope)"       # for groups: scope (Global/DomainLocal/Universal)
+                DN             = "$($g.DistinguishedName)"
+            }
+            if ("$($g.GroupCategory)" -eq 'Security') { $GrpSecurity++; $ListGrpSecurity.Add($grow) } else { $GrpDistribution++; $ListGrpDistribution.Add($grow) }
             switch ("$($g.GroupScope)") {
-                'Global' { $GrpGlobal++ }
-                'DomainLocal' { $GrpDomainLocal++ }
-                'Universal' { $GrpUniversal++ }
+                'Global' { $GrpGlobal++; $ListGrpGlobal.Add($grow) }
+                'DomainLocal' { $GrpDomainLocal++; $ListGrpDomainLocal.Add($grow) }
+                'Universal' { $GrpUniversal++; $ListGrpUniversal.Add($grow) }
             }
         }
     } catch {}
@@ -214,6 +254,24 @@ $Summary = [ordered]@{
         security=$GrpSecurity; distribution=$GrpDistribution
         global=$GrpGlobal; domainLocal=$GrpDomainLocal; universal=$GrpUniversal
     }
+    lists       = [ordered]@{
+        userEnabled       = @($ListUserEnabled)
+        userDisabled      = @($ListUserDisabled)
+        userStale         = @($ListUserStale)
+        userNeverLogged   = @($ListUserNeverLogged)
+        userLocked        = @($ListUserLocked)
+        userPwdNeverExp   = @($ListUserPwdNeverExp)
+        compEnabled       = @($ListCompEnabled)
+        compDisabled      = @($ListCompDisabled)
+        compStale         = @($ListCompStale)
+        compServers       = @($ListCompServers)
+        compClients       = @($ListCompClients)
+        grpSecurity       = @($ListGrpSecurity)
+        grpDistribution   = @($ListGrpDistribution)
+        grpGlobal         = @($ListGrpGlobal)
+        grpDomainLocal    = @($ListGrpDomainLocal)
+        grpUniversal      = @($ListGrpUniversal)
+    }
 }
 $DataJSON = ConvertTo-Json -InputObject $Summary -Depth 12 -Compress
 
@@ -228,13 +286,13 @@ $HTML = @"
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg:#f7f5fc; --surface:#ffffff; --surface2:#f2eefb; --surface3:#e6ddf6; --border:#eae1f7; --text:#1c1330; --muted:#6b5f85;
-  --accent:#7c3aed; --accent-2:#9333ea; --accent-soft:#ede3fd; --violet:#6d28d9; --fuchsia:#c026d3;
+  --bg:#f5f6fb; --surface:#ffffff; --surface2:#eef1f9; --surface3:#dfe4f2; --border:#e4e7f2; --text:#161a2e; --muted:#64708c;
+  --accent:#4f46e5; --accent-2:#6366f1; --accent-soft:#e6e6fd; --navy:#3730a3; --violet:#6d28d9; --fuchsia:#c026d3;
   --green:#059669; --green-soft:#d1fae5; --red:#dc2626; --red-soft:#fde2e2; --amber:#d97706; --amber-soft:#fef3c7;
-  --blue:#2563eb; --blue-soft:#dbe8fe; --teal:#0d9488; --teal-soft:#cdeee9; --pink:#db2777; --pink-soft:#fce7f3; --cyan:#0891b2; --cyan-soft:#cffafe;
-  --radius:14px; --radius-sm:9px;
-  --shadow:0 2px 8px rgb(90 40 160 / 0.06), 0 1px 2px rgb(90 40 160 / 0.04);
-  --shadow-hover:0 10px 28px rgb(90 40 160 / 0.14);
+  --blue:#2563eb; --blue-soft:#dbe8fe; --teal:#0d9488; --teal-soft:#cdeee9; --purple:#7c3aed; --purple-soft:#ede9fe; --pink:#db2777; --pink-soft:#fce7f3; --cyan:#0891b2; --cyan-soft:#cffafe;
+  --radius:13px; --radius-sm:9px;
+  --shadow:0 2px 8px rgb(60 50 140 / 0.06), 0 1px 2px rgb(60 50 140 / 0.04);
+  --shadow-hover:0 9px 26px rgb(60 50 140 / 0.14);
   --font:'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --mono:'SFMono-Regular', ui-monospace, Menlo, Consolas, monospace;
 }
@@ -297,9 +355,16 @@ body { font-family:var(--font); background:var(--bg); color:var(--text); min-hei
 
 /* Stat pills row */
 .pill-row { display:flex; gap:12px; flex-wrap:wrap; }
-.pill { flex:1; min-width:120px; background:var(--surface2); border-radius:var(--radius-sm); padding:14px 16px; text-align:center; }
+.pill { position:relative; flex:1; min-width:120px; background:var(--surface2); border-radius:var(--radius-sm); padding:14px 16px; text-align:center; }
 .pill .n { font-size:22px; font-weight:800; letter-spacing:-0.01em; } .pill .l { font-size:11px; color:var(--muted); margin-top:4px; }
 .pill.good .n { color:var(--green); } .pill.warn .n { color:var(--amber); } .pill.bad .n { color:var(--red); }
+/* download-list button */
+.dlbtn { position:absolute; top:8px; right:8px; width:24px; height:24px; border-radius:7px; border:1px solid var(--border); background:var(--surface); color:var(--muted); display:flex; align-items:center; justify-content:center; cursor:pointer; font-size:12px; transition:all 0.14s; padding:0; }
+.dlbtn:hover { background:var(--accent); color:#fff; border-color:var(--accent); transform:translateY(-1px); }
+.dlbtn:disabled { opacity:0.35; cursor:not-allowed; }
+.dlbtn.on-kpi { top:14px; right:14px; }
+.dlbtn.dl-inline { position:static; display:inline-flex; width:20px; height:20px; font-size:10px; vertical-align:middle; margin-left:2px; }
+.kpi { position:relative; }
 
 /* Domain comparison table */
 .dtable { width:100%; border-collapse:collapse; font-size:13px; }
@@ -351,6 +416,35 @@ const D = $DataJSON;
 function esc(s){ return (''+(s==null?'':s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function nfmt(n){ return (n==null?0:n).toLocaleString(); }
 
+// Build a CSV from a list in D.lists and trigger a download. Fully client-side, offline.
+function downloadList(listKey, fileslug){
+  const rows = (D.lists && D.lists[listKey]) ? D.lists[listKey] : [];
+  if(!rows || !rows.length){ return; }
+  // Group lists reuse the Enabled/LastLogon fields to carry Category/Scope; relabel the header for them.
+  const isGroup = listKey.indexOf('grp')===0;
+  const cols = ['Name','SamAccountName','Enabled','LastLogon','DN'];
+  const headers = isGroup ? ['Name','SamAccountName','Category','Scope','DN'] : cols;
+  const q = v => { v = (v==null ? '' : (''+v)); return /[",\r\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v; };
+  let csv = headers.join(',') + '\r\n';
+  rows.forEach(r => { csv += cols.map(c => q(r[c])).join(',') + '\r\n'; });
+  // BOM so Excel opens UTF-8 correctly
+  const blob = new Blob(['\uFEFF'+csv], {type:'text/csv;charset=utf-8;'});
+  const stamp = new Date().toISOString().slice(0,10);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = fileslug + '_' + stamp + '.csv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url), 100);
+}
+
+// Small inline download button (for legends and bar rows)
+function dlInline(listKey, fileslug){
+  const list = (D.lists && D.lists[listKey]) ? D.lists[listKey] : null;
+  const hasList = Array.isArray(list) && list.length>0;
+  if(!hasList) return '';
+  return ' <button class="dlbtn dl-inline" title="Download '+nfmt(list.length)+' records as CSV" onclick="downloadList(\''+listKey+'\',\''+fileslug+'\')"><i class="bi bi-download"></i></button>';
+}
+
 function renderHero(){
   const f=D.forest||{};
   document.getElementById('hero').innerHTML=
@@ -369,10 +463,18 @@ function renderHero(){
 
 function renderKpis(){
   const t=D.totals||{};
-  function kpi(num,lbl,ico,cls){ return '<div class="kpi '+(cls||'')+'"><div class="top"><div class="chip"><i class="bi '+ico+'"></i></div></div><div class="num">'+nfmt(num)+'</div><div class="lbl">'+lbl+'</div></div>'; }
+  // dlKey: optional list key to enable a download button on the KPI
+  function kpi(num,lbl,ico,cls,dlKey,fileslug){
+    const list = (dlKey && D.lists && D.lists[dlKey]) ? D.lists[dlKey] : null;
+    const hasList = Array.isArray(list) && list.length>0;
+    const dl = dlKey
+      ? '<button class="dlbtn on-kpi" '+(hasList?'':'disabled')+' title="'+(hasList?('Download '+nfmt(list.length)+' records as CSV'):'No records to download')+'" onclick="downloadList(\''+dlKey+'\',\''+fileslug+'\')"><i class="bi bi-download"></i></button>'
+      : '';
+    return '<div class="kpi '+(cls||'')+'">'+dl+'<div class="top"><div class="chip"><i class="bi '+ico+'"></i></div></div><div class="num">'+nfmt(num)+'</div><div class="lbl">'+lbl+'</div></div>';
+  }
   document.getElementById('kpis').innerHTML=
-    kpi(t.users,'Users','bi-people-fill','c-users')
-    + kpi(t.computers,'Computers','bi-pc-display','c-comp')
+    kpi(t.users,'Users','bi-people-fill','c-users','userEnabled','all-enabled-users')
+    + kpi(t.computers,'Computers','bi-pc-display','c-comp','compEnabled','all-enabled-computers')
     + kpi(t.groups,'Groups','bi-collection-fill','c-groups')
     + kpi(t.ous,'Organizational Units','bi-folder-fill','c-ous')
     + kpi(t.gpos,'Group Policies','bi-file-earmark-ruled','c-gpos')
@@ -412,12 +514,27 @@ function renderAcctPosture(){
   ];
   let h='<div class="donut-flex">'+donutSvg(segs,nfmt(total),'accounts')+legend(segs)+'</div>';
   h+='<div class="pill-row" style="margin-top:20px">'
-    +'<div class="pill good"><div class="n">'+nfmt(a.enabled||0)+'</div><div class="l">Enabled</div></div>'
-    +'<div class="pill"><div class="n">'+nfmt(a.disabled||0)+'</div><div class="l">Disabled</div></div>'
-    +'<div class="pill warn"><div class="n">'+nfmt(a.pwdNeverExp||0)+'</div><div class="l">Pwd Never Exp</div></div>'
-    +'<div class="pill"><div class="n">'+nfmt(a.neverLoggedOn||0)+'</div><div class="l">Never Logged On</div></div>'
+    +statPill(a.enabled||0,'Enabled','good','userEnabled','enabled-users')
+    +statPill(a.disabled||0,'Disabled','','userDisabled','disabled-users')
+    +statPill(a.pwdNeverExp||0,'Pwd Never Exp','warn','userPwdNeverExp','password-never-expires')
+    +statPill(a.neverLoggedOn||0,'Never Logged On','','userNeverLogged','never-logged-on')
+    +'</div>';
+  h+='<div class="pill-row" style="margin-top:12px">'
+    +statPill(a.stale||0,'Stale','warn','userStale','stale-users')
+    +statPill(a.locked||0,'Locked','bad','userLocked','locked-users')
     +'</div>';
   document.getElementById('acctPosture').innerHTML=h;
+}
+
+// Build a stat pill with an optional CSV-download button.
+// listKey references D.lists[listKey]; fileslug is the CSV filename stem.
+function statPill(num, label, cls, listKey, fileslug){
+  const list = (D.lists && D.lists[listKey]) ? D.lists[listKey] : null;
+  const hasList = Array.isArray(list) && list.length>0;
+  const dl = listKey
+    ? '<button class="dlbtn" '+(hasList?'':'disabled')+' title="'+(hasList?('Download '+nfmt(list.length)+' records as CSV'):'No records to download')+'" onclick="downloadList(\''+listKey+'\',\''+fileslug+'\')"><i class="bi bi-download"></i></button>'
+    : '';
+  return '<div class="pill '+(cls||'')+'">'+dl+'<div class="n">'+nfmt(num)+'</div><div class="l">'+esc(label)+'</div></div>';
 }
 
 function hbars(elId, rows, palette){
@@ -434,13 +551,18 @@ function renderOsBars(){
 function renderGroupBreakdown(){
   const g=D.groups||{};
   let h='<div style="margin-bottom:18px"><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:600;margin-bottom:10px">By Type</div>';
+  // custom legend with download buttons
+  const typeLegend='<div class="donut-legend">'
+    +'<div class="dl"><span class="dot" style="background:var(--accent)"></span>Security<b>'+nfmt(g.security||0)+'</b>'+dlInline('grpSecurity','security-groups')+'</div>'
+    +'<div class="dl"><span class="dot" style="background:var(--pink)"></span>Distribution<b>'+nfmt(g.distribution||0)+'</b>'+dlInline('grpDistribution','distribution-groups')+'</div>'
+    +'</div>';
   h+='<div class="donut-flex" style="justify-content:flex-start;gap:18px">'+donutSvg([{label:'Security',v:g.security||0,c:'var(--accent)'},{label:'Distribution',v:g.distribution||0,c:'var(--pink)'}], nfmt((g.security||0)+(g.distribution||0)),'groups')
-    +legend([{label:'Security',v:g.security||0,c:'var(--accent)'},{label:'Distribution',v:g.distribution||0,c:'var(--pink)'}])+'</div></div>';
+    +typeLegend+'</div></div>';
   h+='<div><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:600;margin-bottom:10px">By Scope</div>';
-  const scopeRows=[{label:'Global',count:g.global||0},{label:'Domain Local',count:g.domainLocal||0},{label:'Universal',count:g.universal||0}];
+  const scopeRows=[{label:'Global',count:g.global||0,key:'grpGlobal',slug:'global-groups'},{label:'Domain Local',count:g.domainLocal||0,key:'grpDomainLocal',slug:'domainlocal-groups'},{label:'Universal',count:g.universal||0,key:'grpUniversal',slug:'universal-groups'}];
   const max=Math.max(1,...scopeRows.map(r=>r.count));
   const pal=['var(--blue)','var(--teal)','var(--amber)'];
-  h+='<div class="hbar">'+scopeRows.map((r,i)=>{ const pct=(r.count/max)*100; return '<div class="hbar-row"><span class="hbar-label">'+r.label+'</span><span class="hbar-track"><span class="hbar-fill" style="width:'+pct+'%;background:'+pal[i]+'">'+(pct>18?nfmt(r.count):'')+'</span></span><span class="hbar-val">'+nfmt(r.count)+'</span></div>'; }).join('')+'</div></div>';
+  h+='<div class="hbar">'+scopeRows.map((r,i)=>{ const pct=(r.count/max)*100; return '<div class="hbar-row"><span class="hbar-label">'+r.label+'</span><span class="hbar-track"><span class="hbar-fill" style="width:'+pct+'%;background:'+pal[i]+'">'+(pct>18?nfmt(r.count):'')+'</span></span><span class="hbar-val">'+nfmt(r.count)+dlInline(r.key,r.slug)+'</span></div>'; }).join('')+'</div></div>';
   document.getElementById('groupBreakdown').innerHTML=h;
 }
 
