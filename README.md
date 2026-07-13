@@ -115,6 +115,7 @@ These three modules are the first release of an ongoing Active Directory Audit S
 
 Watch or ⭐ the repo to catch new modules as they land.
 
+For more detail on the project direction, see [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ---
 

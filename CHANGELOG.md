@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [1.1.0] — 2026-07-12
+## [1.1.0] — 2026-07-10
 
 ### Added
 - **Topology** now includes three analysis panels, opened from the toolbar:
