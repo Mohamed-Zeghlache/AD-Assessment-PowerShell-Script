@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.0] — 2026-08-03
+
+### Added
+- **Account Security** (\`AD-AccountSecurity.ps1\`) — new module covering default password & lockout policy (scored against a recommended baseline), fine-grained password policies (PSOs), managed service accounts (gMSA/sMSA), LAPS coverage (Windows and Legacy), LAPS read-delegation audit, risky user accounts (password-never-expires, password-not-required, unconstrained delegation, SID history, inactive-but-enabled, stale service-account passwords), risky computer accounts (stale logons, old machine passwords, legacy/EOL OS, unconstrained delegation), and krbtgt password age. Long lists stay off the main page behind per-category "Open" (full-page view) and CSV-download actions.
+
 ## [1.1.0] — 2026-07-10
 
 ### Added

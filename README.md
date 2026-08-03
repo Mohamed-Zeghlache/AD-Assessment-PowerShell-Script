@@ -13,6 +13,7 @@ Every module is one script. Run it on a domain-joined machine with the AD PowerS
 | **Overview** | \`AD-Overview.ps1\` | Forest & domain facts, object inventory, account posture, OS distribution, group breakdown |
 | **Topology** | \`AD-Topology.ps1\` | Forest → domain → site → DC hierarchy with health, FSMO roles, services, replication links, dcdiag |
 | **DC Inventory** | \`AD-DCInventory.ps1\` | Per-DC inventory plus hardware & performance specs (CPU, RAM, disks, NICs) |
+| **Account Security** | \`AD-AccountSecurity.ps1\` | Password/lockout policy, fine-grained password policies, managed service accounts, LAPS coverage, risky user & computer accounts, krbtgt age |
 
 Each module has its own distinct visual design so reports are instantly recognisable.
 
@@ -61,6 +62,18 @@ Per-DC inventory plus deep hardware and performance detail. KPI cards for online
 
 ---
 
+## Account Security
+
+![AD Account Security demo](docs/AccountSecurity-demo.png)
+
+Credential hygiene across the domain. Scores the default password & lockout policy against a recommended baseline, lists fine-grained password policies (PSOs) with precedence and who they apply to, inventories managed service accounts (gMSA/sMSA) and LAPS coverage (Windows and Legacy), and flags risky accounts — password-never-expires, password-not-required, unconstrained delegation, SID history, inactive-but-enabled users, stale service-account passwords, stale/legacy/EOL-OS computers — plus krbtgt password age. Long lists stay off the main page behind per-category **Open** (full-page view) and **CSV download** actions so a large tenant stays readable. Optional sources (LAPS schema, KDS root key, etc.) degrade gracefully to "Not available" instead of failing.
+
+\`\`\`powershell
+.\scripts\AD-AccountSecurity.ps1
+\`\`\`
+
+---
+
 ## Common parameters
 
 Every module accepts:
@@ -70,7 +83,7 @@ Every module accepts:
 | \`-OutputPath\` | current directory | Folder to write the HTML report to |
 | \`-OpenReport\` | \`\$true\` | Open the report in the default browser when finished |
 
-Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC Inventory). Run \`Get-Help .\scripts\<script>.ps1 -Full\` for details.
+Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC Inventory, \`-InactiveDays\`/\`-StaleComputerDays\`/\`-ServiceAccountStalePasswordDays\` on Account Security). Run \`Get-Help .\scripts\<script>.ps1 -Full\` for details.
 
 > **Execution policy:** if a script is blocked, run it for the current process only:
 > \`\`\`powershell
@@ -105,13 +118,13 @@ The [\`examples/\`](examples/) folder contains a sample HTML report for each mod
 - Each script writes **only** its single HTML report to your chosen \`-OutputPath\`. Nothing else is created or changed.
 - No credentials, passwords, or tokens are stored or transmitted.
 
-The reports contain infrastructure detail (domain/DC names, IPs, group memberships, etc.), so treat them as confidential and store/share them accordingly.
+The reports contain infrastructure and security-posture detail (domain/DC names, IPs, group memberships, password policy weaknesses, risky account lists, etc.), so treat them as confidential and store/share them accordingly.
 
 ---
 
 ## Part of a larger project
 
-These three modules are the first release of an ongoing Active Directory Audit Suite. Additional modules covering other areas of AD health and security are in development and will be published here one by one. The long-term goal is a single orchestrator that runs all modules together and produces a comprehensive combined report.
+These four modules are part of an ongoing Active Directory Audit Suite. Additional modules covering other areas of AD health and security are in development and will be published here one by one. The long-term goal is a single orchestrator that runs all modules together and produces a comprehensive combined report.
 
 Watch or ⭐ the repo to catch new modules as they land.
 
