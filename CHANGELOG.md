@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.0] — 2026-08-08
+
+### Added
+- **Trust Relationships** (\`AD-TrustRelationships.ps1\`) — new module enumerating every AD trust and assessing its security posture: partner domain, direction, trust type, and transitivity; SID filtering, selective authentication, TGT delegation, and forest-transitive flags; a per-trust connectivity probe that degrades gracefully when a partner is unreachable; and derived risk findings (SID filtering disabled on an external/forest trust, selective auth off, stale trusts). Includes KPI tiles, a filterable trust explorer with detail panel, and an interactive trust map.
+
 ## [1.2.0] — 2026-08-03
 
 ### Added
