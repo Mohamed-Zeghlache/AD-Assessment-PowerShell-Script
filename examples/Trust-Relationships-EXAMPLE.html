@@ -1,0 +1,696 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trust Relationships — contoso.lab</title>
+<style id="bi-icons">/* Bootstrap Icons 1.10.0 - subset (36 glyphs) embedded for offline use */
+@font-face{font-display:block;font-family:"bootstrap-icons";src:url(data:font/woff2;base64,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) format("woff2")}
+.bi::before,[class^="bi-"]::before,[class*=" bi-"]::before{display:inline-block;font-family:bootstrap-icons!important;font-style:normal;font-weight:normal!important;font-variant:normal;text-transform:none;line-height:1;vertical-align:-.125em;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+.bi-arrow-counterclockwise::before{content:"\f117"}
+.bi-arrow-left-right::before{content:"\f12b"}
+.bi-arrow-right::before{content:"\f138"}
+.bi-aspect-ratio::before{content:"\f150"}
+.bi-bar-chart-line::before{content:"\f17c"}
+.bi-box-arrow-in-left::before{content:"\f1bd"}
+.bi-box-arrow-right::before{content:"\f1c3"}
+.bi-box-arrow-up-right::before{content:"\f1c5"}
+.bi-check-circle-fill::before{content:"\f26a"}
+.bi-chevron-right::before{content:"\f285"}
+.bi-clock-history::before{content:"\f292"}
+.bi-dash-circle::before{content:"\f2e6"}
+.bi-diagram-2::before{content:"\f2ec"}
+.bi-diagram-3::before{content:"\f2ee"}
+.bi-door-open::before{content:"\f308"}
+.bi-exclamation-octagon::before{content:"\f337"}
+.bi-exclamation-octagon-fill::before{content:"\f336"}
+.bi-exclamation-triangle-fill::before{content:"\f33a"}
+.bi-grid-1x2::before{content:"\f3f4"}
+.bi-hand-index-thumb::before{content:"\f402"}
+.bi-info-circle::before{content:"\f431"}
+.bi-info-circle-fill::before{content:"\f430"}
+.bi-list-ul::before{content:"\f478"}
+.bi-moon-stars::before{content:"\f496"}
+.bi-pie-chart::before{content:"\f4e9"}
+.bi-plug::before{content:"\f4f7"}
+.bi-plug-fill::before{content:"\f4f6"}
+.bi-printer::before{content:"\f501"}
+.bi-question-circle::before{content:"\f505"}
+.bi-share::before{content:"\f52e"}
+.bi-shield-lock::before{content:"\f538"}
+.bi-shield-slash::before{content:"\f53d"}
+.bi-shuffle::before{content:"\f544"}
+.bi-sun::before{content:"\f5a2"}
+.bi-x-circle-fill::before{content:"\f622"}
+.bi-x-lg::before{content:"\f659"}
+</style>
+<style>
+:root {
+  --bg: #f8fafc; --surface: #ffffff; --surface2: #f1f5f9; --surface3: #e2e8f0;
+  --border: #e2e8f0; --text: #0f172a; --muted: #64748b;
+  --accent: #4f46e5; --accent-hover: #4338ca; --accent-soft: #e0e7ff;
+  --blue: #3b82f6; --blue-soft: #dbeafe; --green: #10b981; --green-soft: #d1fae5;
+  --red: #ef4444; --red-soft: #fee2e2; --amber: #f59e0b; --amber-soft: #fef3c7;
+  --teal: #14b8a6; --teal-soft: #ccfbf1; --pink: #ec4899; --pink-soft: #fce7f3;
+  --purple: #8b5cf6; --purple-soft: #ede9fe;
+  --radius: 12px; --radius-sm: 8px;
+  --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.05), 0 2px 4px -2px rgb(0 0 0 / 0.05);
+  --shadow-hover: 0 10px 15px -3px rgb(0 0 0 / 0.08), 0 4px 6px -4px rgb(0 0 0 / 0.08);
+  --font: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+[data-theme="dark"] {
+  --bg: #0f172a; --surface: #1e293b; --surface2: #334155; --surface3: #475569;
+  --border: #334155; --text: #f8fafc; --muted: #94a3b8;
+  --accent: #6366f1; --accent-hover: #818cf8; --accent-soft: rgba(99,102,241,0.15);
+  --blue: #60a5fa; --blue-soft: rgba(59,130,246,0.15); --green: #34d399; --green-soft: rgba(16,185,129,0.15);
+  --red: #f87171; --red-soft: rgba(239,68,68,0.15); --amber: #fbbf24; --amber-soft: rgba(245,158,11,0.15);
+  --teal: #2dd4bf; --teal-soft: rgba(20,184,166,0.15); --pink: #f472b6; --pink-soft: rgba(236,72,153,0.15);
+  --purple: #a78bfa; --purple-soft: rgba(139,92,246,0.15);
+  --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.2), 0 2px 4px -2px rgb(0 0 0 / 0.2);
+  --shadow-hover: 0 10px 15px -3px rgb(0 0 0 / 0.3), 0 4px 6px -4px rgb(0 0 0 / 0.3);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: var(--font); background: var(--bg); color: var(--text); min-height: 100vh; font-size: 14px; -webkit-font-smoothing: antialiased; }
+.topbar { background: var(--surface); border-bottom: 1px solid var(--border); padding: 14px 28px; display: flex; align-items: center; gap: 16px; position: sticky; top: 0; z-index: 100; box-shadow: var(--shadow); }
+.brand { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; color: var(--text); }
+.brand i { font-size: 22px; color: var(--accent); }
+.topmeta { margin-left: auto; font-size: 12px; color: var(--muted); text-align: right; line-height: 1.4; }
+.topmeta b { color: var(--text); font-weight: 600; }
+.btn { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: all 0.2s ease; font-family: var(--font); }
+.btn:hover { background: var(--surface2); border-color: var(--surface3); }
+.btn i { font-size: 14px; color: var(--muted); }
+.btn:hover i { color: var(--text); }
+.sep { width: 1px; height: 24px; background: var(--border); }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 28px 64px; }
+@media(max-width: 760px){ .wrap { padding: 20px 18px; } }
+.section-label { font-size:18px; font-weight:700; color:#465262; margin:30px 0 14px; display:flex; align-items:center; gap:8px; }
+.section-label:first-child { margin-top: 4px; }
+.section-label i { color:inherit; font-size:16px; }
+.banner-note { font-size: 12px; color: var(--muted); background: var(--surface2); border: 1px dashed var(--border); border-radius: var(--radius-sm); padding: 8px 12px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+.banner-note i { color: var(--amber); }
+
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; display: flex; align-items: center; gap: 16px; box-shadow: var(--shadow); transition: box-shadow .2s ease, border-color .2s ease; position: relative; }
+.kpi.clickable { cursor: pointer; }
+.kpi.clickable:hover { box-shadow: var(--shadow-hover); border-color: var(--accent-soft); }
+.kpi.active { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow); }
+.kpi .chip { width: 48px; height: 48px; border-radius: var(--radius-sm); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 22px; background: var(--accent-soft); color: var(--accent); }
+.kpi .body { min-width: 0; }
+.kpi .val { font-size: 26px; font-weight: 800; color: var(--text); line-height: 1.1; letter-spacing: -0.02em; }
+.kpi .lbl { font-size: 12px; color: var(--muted); font-weight: 500; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kpi .hint { font-size: 11px; color: var(--accent); margin-top: 4px; display: flex; align-items: center; gap: 4px; font-weight: 500; }
+.kpi.clickable:hover .hint { display: flex; }
+.kpi.k-amber .chip { background: var(--amber-soft); color: var(--amber); } .kpi.k-amber.active { border-color: var(--amber); box-shadow: 0 0 0 3px var(--amber-soft); }
+.kpi.k-red .chip { background: var(--red-soft); color: var(--red); } .kpi.k-red.active { border-color: var(--red); box-shadow: 0 0 0 3px var(--red-soft); }
+.kpi.k-green .chip { background: var(--green-soft); color: var(--green); }
+.kpi.k-blue .chip { background: var(--blue-soft); color: var(--blue); }
+.kpi.k-teal .chip { background: var(--teal-soft); color: var(--teal); }
+
+.dash-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; margin-bottom: 28px; }
+.chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; box-shadow: var(--shadow); display: flex; flex-direction: column; }
+.chart-card h3 { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+.chart-card h3 i { color: var(--accent); font-size: 15px; }
+.col-4 { grid-column: span 4; } .col-6 { grid-column: span 6; } .col-8 { grid-column: span 8; } .col-12 { grid-column: span 12; }
+@media(max-width: 900px){ .col-4,.col-6,.col-8 { grid-column: span 12; } }
+
+/* Trust graph - forest/domain topology */
+.graph-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 28px; overflow: hidden; }
+.graph-head { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 600; }
+.graph-head i { color: var(--accent); font-size: 16px; }
+.graph-tools { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.graph-tools button { background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-size: 12px; padding: 6px 10px; border-radius: var(--radius-sm); cursor: pointer; font-weight: 500; display: flex; align-items: center; gap: 5px; }
+.graph-tools button:hover { background: var(--surface3); }
+.graph-legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 10px 20px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); background: var(--surface2); }
+.graph-legend .lg { display: flex; align-items: center; gap: 6px; }
+.graph-legend .ln { width: 22px; height: 0; border-top: 2px solid var(--muted); }
+.graph-legend .ln.bidir { border-color: var(--green); }
+.graph-legend .ln.oneway { border-top-style: dashed; border-color: var(--blue); }
+.graph-legend .ln.risk { border-color: var(--red); }
+.graph-legend .shp { width: 13px; height: 13px; flex-shrink: 0; }
+#graphSvg { display: block; width: 100%; height: 480px; cursor: grab; background: var(--bg); touch-action: none; }
+#graphSvg.grabbing { cursor: grabbing; }
+.forest-group { cursor: grab; }
+.forest-tri { fill: var(--surface2); stroke: var(--accent); stroke-width: 1.5; opacity: 0.55; }
+.forest-tri.ext { stroke: var(--purple); }
+.forest-label { font-size: 11px; font-weight: 700; fill: var(--muted); pointer-events: none; }
+.dnode { cursor: pointer; }
+.dnode rect { stroke-width: 1.5; transition: filter 0.15s; }
+.dnode:hover rect { filter: brightness(1.06); }
+.dnode text { font-size: 10.5px; font-weight: 600; pointer-events: none; }
+.dnode .dn-role { font-size: 8px; font-weight: 600; pointer-events: none; opacity: 0.7; }
+.glink { stroke-width: 2; fill: none; }
+.glink.bidir { stroke: var(--green); }
+.glink.oneway { stroke: var(--blue); stroke-dasharray: 6 4; }
+.glink.risk { stroke: var(--red); stroke-width: 2.5; }
+.glink-label { font-size: 9px; fill: var(--muted); pointer-events: none; }
+.donut-flex { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; justify-content: center; }
+.donut-legend { display: flex; flex-direction: column; gap: 9px; font-size: 12.5px; }
+.donut-legend .dl { display: flex; align-items: center; gap: 8px; color: var(--text); }
+.donut-legend .dl .dot { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
+.donut-legend .dl b { margin-left: 4px; }
+.hbar { display: flex; flex-direction: column; gap: 11px; }
+.hbar-row { display: grid; grid-template-columns: 120px 1fr 34px; align-items: center; gap: 10px; font-size: 12.5px; }
+.hbar-label { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; font-weight: 500; }
+.hbar-track { background: var(--surface2); border-radius: 999px; height: 18px; overflow: hidden; }
+.hbar-fill { height: 100%; border-radius: 999px; transition: width 0.5s ease; }
+.hbar-val { font-weight: 700; font-size: 11px; color: var(--muted); }
+.stat-strip { display: flex; gap: 14px; }
+.stat-pill { flex: 1; background: var(--surface2); border-radius: var(--radius-sm); padding: 14px; text-align: center; }
+.stat-pill .v { font-size: 22px; font-weight: 800; }
+.stat-pill .l { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 3px; font-weight: 600; }
+
+.layout { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+@media(max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+.panel-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); display: flex; flex-direction: column; }
+.panel-head { padding: 16px 20px; border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 10px; }
+.panel-head i { color: var(--muted); font-size: 16px; }
+.list-search { padding: 12px 20px; border-bottom: 1px solid var(--border); }
+.list-search input { width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 14px; color: var(--text); font-size: 13px; outline: none; transition: all 0.2s; font-family: var(--font); }
+.list-search input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); background: var(--surface); }
+.trust-list { padding: 10px; max-height: 600px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.trust-item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; transition: all 0.15s; background: var(--surface); }
+.trust-item:hover { background: var(--surface2); border-color: var(--accent-soft); }
+.trust-item.sel { background: var(--accent-soft); border-color: var(--accent); }
+.trust-item.dimmed { opacity: 0.3; }
+.trust-ico { width: 38px; height: 38px; border-radius: var(--radius-sm); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 17px; background: var(--accent-soft); color: var(--accent); }
+.trust-ico.sev-high { background: var(--red-soft); color: var(--red); }
+.trust-ico.sev-medium { background: var(--amber-soft); color: var(--amber); }
+.trust-ico.sev-low { background: var(--blue-soft); color: var(--blue); }
+.trust-ico.sev-ok { background: var(--green-soft); color: var(--green); }
+.trust-body { flex: 1; min-width: 0; }
+.trust-name { font-size: 13.5px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trust-sub { font-size: 11px; color: var(--muted); margin-top: 2px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dir-pill { font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 999px; background: var(--surface3); color: var(--text); }
+.sev-dot { width: 9px; height: 9px; border-radius: 999px; flex-shrink: 0; }
+.sev-dot.high { background: var(--red); } .sev-dot.medium { background: var(--amber); } .sev-dot.low { background: var(--blue); } .sev-dot.ok { background: var(--green); }
+
+.detail { flex: 1; display: flex; flex-direction: column; }
+.detail-empty { padding: 60px 20px; text-align: center; color: var(--muted); font-size: 14px; margin: auto; }
+.detail-empty i { font-size: 32px; color: var(--border); margin-bottom: 16px; display: block; }
+.detail-head { padding: 20px; border-bottom: 1px solid var(--border); }
+.detail-title { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 10px; word-break: break-word; color: var(--text); }
+.detail-sub { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.detail-body { padding: 24px 20px; overflow-y: auto; flex: 1; }
+.dsec { margin-bottom: 28px; } .dsec:last-child { margin-bottom: 0; }
+.dsec-t { font-size: 12px; font-weight: 700; color: var(--text); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+.dsec-t i { color: var(--muted); font-size: 14px; }
+.dsec-t::after { content: ''; flex: 1; height: 1px; background: var(--border); margin-left: 8px; }
+.kv-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.kv { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 11px 13px; }
+.kv .k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+.kv .v { font-size: 14px; font-weight: 600; color: var(--text); margin-top: 3px; display: flex; align-items: center; gap: 6px; }
+.kv .v.good { color: var(--green); } .kv .v.bad { color: var(--red); } .kv .v.warn { color: var(--amber); } .kv .v.mut { color: var(--muted); }
+.muted-note { color: var(--muted); font-size: 13px; padding: 16px; background: var(--surface2); border-radius: var(--radius-sm); border: 1px dashed var(--border); text-align: center; }
+::-webkit-scrollbar { width: 8px; height: 8px; } ::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--surface3); border-radius: 999px; border: 2px solid var(--surface); } ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+.filter-banner { background: var(--surface); border: 1px solid var(--accent); border-radius: var(--radius); padding: 16px 20px; margin-bottom: 20px; box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow); }
+.filter-banner-head { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 600; margin-bottom: 12px; color: var(--text); }
+.filter-banner-head i { color: var(--accent); font-size: 16px; }
+.fb-list { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
+.fb-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; transition: all 0.15s; }
+.fb-row:hover { background: var(--surface); border-color: var(--accent); }
+.fb-row .nm { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-row .cx { font-size: 11px; font-weight: 600; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; }
+</style>
+<style>
+.modal-overlay{position:fixed;inset:0;background:rgba(15,23,42,0.55);display:none;align-items:center;justify-content:center;z-index:200;padding:24px}
+.modal-overlay.open{display:flex}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 20px 60px rgba(0,0,0,0.35);width:100%;max-width:560px;max-height:85vh;overflow:auto;position:relative}
+.modal-close{position:absolute;top:8px;right:12px;background:transparent;border:none;font-size:26px;line-height:1;color:var(--muted);cursor:pointer;z-index:2}
+.modal-close:hover{color:var(--text)}
+#modalBody{padding:8px}
+</style>
+</head>
+<body data-theme="light">
+
+<div class="topbar">
+  <div class="brand"><i class="bi bi-shuffle"></i> Trust Relationships</div>
+  <div class="sep"></div>
+  <button class="btn" onclick="toggleTheme()"><i class="bi bi-moon-stars"></i> Theme</button>
+  <button class="btn" onclick="window.print()"><i class="bi bi-printer"></i> Print</button>
+  <div class="topmeta">Domain: <b>contoso.lab</b><br>Generated: 2026-01-15 10:30:00</div>
+</div>
+
+<div class="wrap">
+  <div class="section-label"><i class="bi bi-diagram-3"></i> Trust Topology</div>
+  <div class="graph-card">
+    <div class="graph-head"><i class="bi bi-share"></i> Interactive Trust Map
+      <div class="graph-tools">
+        <button onclick="graphReset()"><i class="bi bi-arrow-counterclockwise"></i> Reset</button>
+        <button onclick="graphFit()"><i class="bi bi-aspect-ratio"></i> Fit</button>
+      </div>
+    </div>
+    <div class="graph-legend">
+      <div class="lg"><svg class="shp" viewBox="0 0 13 13"><polygon points="6.5,1 12,12 1,12" fill="var(--surface2)" stroke="var(--accent)" stroke-width="1.2"/></svg> Forest</div>
+      <div class="lg"><svg class="shp" viewBox="0 0 13 13"><rect x="1" y="3" width="11" height="7" rx="1.5" fill="var(--accent)"/></svg> This domain</div>
+      <div class="lg"><svg class="shp" viewBox="0 0 13 13"><rect x="1" y="3" width="11" height="7" rx="1.5" fill="var(--teal)"/></svg> Intra-forest domain</div>
+      <div class="lg"><svg class="shp" viewBox="0 0 13 13"><rect x="1" y="3" width="11" height="7" rx="1.5" fill="var(--purple)"/></svg> External domain</div>
+      <div class="lg"><span class="ln bidir"></span> Bidirectional</div>
+      <div class="lg"><span class="ln oneway"></span> One-way</div>
+      <div class="lg"><span class="ln risk"></span> High risk</div>
+    </div>
+    <svg id="graphSvg"></svg>
+  </div>
+
+  <div class="section-label"><i class="bi bi-bar-chart-line"></i> Insights Dashboard</div>
+  <div id="connNote"></div>
+  <div class="dash-grid" id="dashboard"></div>
+
+  <div class="section-label"><i class="bi bi-grid-1x2"></i> Overview</div>
+  <div class="kpi-grid" id="kpis"></div>
+  <div id="filterBanner" style="display:none"></div>
+
+  <div class="section-label"><i class="bi bi-shuffle"></i> Trust Explorer</div>
+  <div class="layout">
+    <div class="panel-card">
+      <div class="panel-head"><i class="bi bi-list-ul"></i> Trusts</div>
+      <div class="list-search"><input id="trustSearch" type="text" placeholder="Filter trusts by name…" oninput="filterList()"></div>
+      <div class="trust-list" id="trustList"></div>
+    </div>
+    <div class="panel-card">
+      <div class="panel-head"><i class="bi bi-info-circle"></i> Details</div>
+      <div class="detail" id="detail">
+        <div class="detail-empty"><i class="bi bi-hand-index-thumb"></i>Select a trust to view its direction, type, and security attributes.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="trustModal" onclick="if(event.target===this)closeTrustModal()"><div class="modal-box"><button class="modal-close" onclick="closeTrustModal()" aria-label="Close">&times;</button><div class="detail" id="modalBody"></div></div></div>
+
+<script>
+const D = {"domain": "contoso.lab", "forest": "contoso.lab", "generatedAt": "2026-01-15 10:30:00", "connectivityRun": true, "totalTrusts": 3, "externalCount": 2, "noSidFilter": 2, "highRisk": 2, "mediumRisk": 0, "lowRisk": 1, "bidirectional": 2, "reachable": 2, "unreachable": 1, "dirDist": [{"label": "Bidirectional", "count": 2}, {"label": "Inbound", "count": 1}], "kindDist": [{"label": "External", "count": 2}, {"label": "Forest", "count": 1}], "posture": {"sidOn": 1, "sidOff": 2, "selOn": 0, "selOff": 2, "extTotal": 2}, "graphNodes": [{"id": "contoso.lab", "label": "contoso.lab", "type": "self", "forest": "contoso.lab"}, {"id": "partnerco.com", "label": "partnerco.com", "type": "external", "forest": "partnerco.com"}, {"id": "eu.contoso.lab", "label": "eu.contoso.lab", "type": "forest", "forest": "contoso.lab"}, {"id": "legacy.local", "label": "legacy.local", "type": "external", "forest": "legacy.local"}], "graphLinks": [{"source": "contoso.lab", "target": "partnerco.com", "direction": "Inbound", "kind": "External", "severity": "high", "sidFiltering": false, "withinForest": false}, {"source": "contoso.lab", "target": "eu.contoso.lab", "direction": "Bidirectional", "kind": "Forest", "severity": "low", "sidFiltering": true, "withinForest": true}, {"source": "contoso.lab", "target": "legacy.local", "direction": "Bidirectional", "kind": "External", "severity": "high", "sidFiltering": false, "withinForest": false}], "trusts": [{"name": "partnerco.com", "partner": "partnerco.com", "direction": "Inbound", "trustType": "Uplevel", "kind": "External", "withinForest": false, "forestTransitive": false, "transitive": false, "sidFiltering": false, "selectiveAuth": false, "usesRC4": true, "tgtDelegation": false, "connectivity": "reachable", "created": "2020-05-01", "modified": "2024-02-10", "ageDays": 2100, "severity": "high", "findings": ["SID filtering is disabled on an external trust", "Trust negotiates RC4 encryption"], "attrRaw": 8}, {"name": "eu.contoso.lab", "partner": "eu.contoso.lab", "direction": "Bidirectional", "trustType": "Uplevel", "kind": "Forest", "withinForest": true, "forestTransitive": true, "transitive": true, "sidFiltering": true, "selectiveAuth": false, "usesRC4": false, "tgtDelegation": false, "connectivity": "reachable", "created": "2019-01-15", "modified": "2023-06-01", "ageDays": 2500, "severity": "low", "findings": [], "attrRaw": 32}, {"name": "legacy.local", "partner": "legacy.local", "direction": "Bidirectional", "trustType": "Uplevel", "kind": "External", "withinForest": false, "forestTransitive": false, "transitive": true, "sidFiltering": false, "selectiveAuth": false, "usesRC4": false, "tgtDelegation": false, "connectivity": "unreachable", "created": "2018-03-01", "modified": "2022-01-01", "ageDays": 2900, "severity": "high", "findings": ["SID filtering is disabled on an external trust", "Selective authentication is not enabled", "Partner domain was unreachable during the scan"], "attrRaw": 0}]};
+const TR = Array.isArray(D.trusts) ? D.trusts : [];
+const byName = {}; TR.forEach(t=>byName[t.name]=t);
+function escapeHtml(s){ return (''+(s==null?'':s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+let activeFilter = null;
+const FILTERS = {
+  all:      {test:t=>true,                         label:'All Trusts', icon:'bi-shuffle'},
+  external: {test:t=>!t.withinForest,              label:'External Trusts', icon:'bi-box-arrow-up-right'},
+  nosid:    {test:t=>!t.withinForest&&!t.sidFiltering, label:'SID Filtering Disabled', icon:'bi-shield-slash'},
+  high:     {test:t=>t.severity==='high',          label:'High-Risk Trusts', icon:'bi-exclamation-octagon'},
+  nosel:    {test:t=>!t.withinForest&&!t.selectiveAuth, label:'Selective Auth Off', icon:'bi-door-open'},
+  bidir:    {test:t=>t.direction==='Bidirectional',label:'Bidirectional Trusts', icon:'bi-arrow-left-right'},
+  unreach:  {test:t=>t.connectivity==='Unreachable', label:'Unreachable Trusts', icon:'bi-plug'}
+};
+
+function renderConnNote(){
+  const el=document.getElementById('connNote');
+  if(!D.connectivityRun){
+    el.innerHTML = '<div class="banner-note"><i class="bi bi-info-circle"></i> Connectivity testing was skipped for this run — partner reachability is shown as "Not tested".</div>';
+  } else if((D.unreachable||0)>0){
+    el.innerHTML = '<div class="banner-note"><i class="bi bi-info-circle"></i> Some partners could not be reached. In locked-down environments this may reflect blocked outbound auth rather than a broken trust.</div>';
+  } else { el.innerHTML=''; }
+}
+
+function renderKpis(){
+  const k=document.getElementById('kpis');
+  function kpi(v,l,ico,cls,fkey){
+    const attrs = fkey ? ('clickable" data-fkey="'+fkey+'" onclick="toggleFilter(\''+fkey+'\')') : '';
+    const hint = fkey ? '<div class="hint">Filter View <i class="bi bi-arrow-right"></i></div>' : '';
+    return '<div class="kpi '+(cls||'')+' '+attrs+'"><div class="chip"><i class="bi '+ico+'"></i></div>'
+      + '<div class="body"><div class="val">'+v+'</div><div class="lbl">'+l+'</div>'+hint+'</div></div>';
+  }
+  k.innerHTML =
+    kpi(D.highRisk||0,'High Risk','bi-exclamation-octagon',((D.highRisk||0)>0?'k-red':'k-green'),'high')
+    + kpi((D.posture&&D.posture.selOff)||0,'Selective Auth Off','bi-door-open',(((D.posture&&D.posture.selOff)||0)>0?'k-amber':'k-green'),'nosel')
+    + kpi(D.noSidFilter||0,'SID Filtering Off','bi-shield-slash',((D.noSidFilter||0)>0?'k-red':'k-green'),'nosid')
+    + kpi(D.bidirectional||0,'Bidirectional','bi-arrow-left-right','k-teal','bidir');
+}
+
+const PALETTE = ['var(--accent)','var(--blue)','var(--teal)','var(--amber)','var(--green)','var(--pink)','var(--purple)','var(--red)'];
+function donutSvg(segs, centerVal, centerLbl, legendLabels){
+  const total = segs.reduce((s,x)=>s+x.v,0);
+  const R=52, SW=16, C=2*Math.PI*R; let off=0; let circles='';
+  if(total>0){ segs.forEach(s=>{ if(s.v<=0) return; const len=(s.v/total)*C;
+    circles += '<circle cx="64" cy="64" r="'+R+'" fill="none" stroke="'+s.c+'" stroke-width="'+SW+'" stroke-dasharray="'+len+' '+(C-len)+'" stroke-dashoffset="'+(-off)+'" transform="rotate(-90 64 64)"/>'; off+=len; });
+  } else { circles = '<circle cx="64" cy="64" r="'+R+'" fill="none" stroke="var(--surface2)" stroke-width="'+SW+'"/>'; }
+  let legend='<div class="donut-legend">'+segs.map((s,i)=>'<div class="dl"><span class="dot" style="background:'+s.c+'"></span>'+legendLabels[i]+'<b>'+s.v+'</b></div>').join('')+'</div>';
+  return '<div class="donut-flex"><svg width="128" height="128" viewBox="0 0 128 128">'+circles
+    + '<text x="64" y="60" text-anchor="middle" font-size="24" font-weight="800" fill="var(--text)">'+centerVal+'</text>'
+    + '<text x="64" y="78" text-anchor="middle" font-size="10" fill="var(--muted)">'+centerLbl+'</text></svg>'+legend+'</div>';
+}
+
+function renderDashboard(){
+  const dash=document.getElementById('dashboard'); let html='';
+
+  // Card 1: risk severity donut (total trusts in centre)
+  const hi=D.highRisk||0, me=D.mediumRisk||0, lo=D.lowRisk||0;
+  const ok=Math.max(0,(D.totalTrusts||0)-hi-me-lo);
+  html += '<div class="chart-card col-6"><h3><i class="bi bi-pie-chart"></i> Risk Posture</h3>'
+    + donutSvg([{v:ok,c:'var(--green)'},{v:lo,c:'var(--blue)'},{v:me,c:'var(--amber)'},{v:hi,c:'var(--red)'}], D.totalTrusts||0, 'trusts', ['OK','Low','Medium','High'])
+    + '</div>';
+
+  // Card 2: trusts by kind (bars)
+  const kd = Array.isArray(D.kindDist)?D.kindDist:[];
+  let c2='<div class="chart-card col-6"><h3><i class="bi bi-diagram-2"></i> Trusts by Type</h3>';
+  if(kd.length){ const max=Math.max(1,...kd.map(d=>d.count));
+    c2 += '<div class="hbar">'+kd.map((d,i)=>{ const pct=(d.count/max)*100;
+      return '<div class="hbar-row"><span class="hbar-label" title="'+escapeHtml(d.label)+'">'+escapeHtml(d.label)+'</span>'
+        +'<span class="hbar-track"><span class="hbar-fill" style="width:'+pct+'%;background:'+PALETTE[i%PALETTE.length]+'"></span></span>'
+        +'<span class="hbar-val">'+d.count+'</span></div>'; }).join('')+'</div>';
+  } else { c2+='<div class="muted-note">No trusts.</div>'; }
+  c2+='</div>'; html+=c2;
+
+  dash.innerHTML = html;
+}
+
+function toggleFilter(fkey){
+  activeFilter = (activeFilter===fkey)?null:fkey;
+  document.querySelectorAll('.kpi[data-fkey]').forEach(t=>t.classList.toggle('active', t.getAttribute('data-fkey')===activeFilter));
+  applyFilter();
+}
+function fctx(fkey,t){
+  switch(fkey){
+    case 'high': return '<span style="color:var(--red)">high</span>';
+    case 'nosel': return '<span style="color:var(--amber)">selective auth off</span>';
+    case 'nosid': return '<span style="color:var(--red)">SID filter off</span>';
+    case 'external': return t.kind;
+    case 'bidir': return t.direction;
+    case 'unreach': return 'unreachable';
+    default: return t.direction;
+  }
+}
+function applyFilter(){
+  const banner=document.getElementById('filterBanner');
+  if(!activeFilter || activeFilter==='all'){
+    banner.style.display='none';
+    document.querySelectorAll('.trust-item.dimmed').forEach(n=>n.classList.remove('dimmed'));
+    if(activeFilter==='all'){ activeFilter=null; document.querySelectorAll('.kpi.active').forEach(t=>t.classList.remove('active')); }
+    return;
+  }
+  const f=FILTERS[activeFilter]; const matches=TR.filter(f.test);
+  banner.style.display='';
+  if(!matches.length){
+    banner.innerHTML='<div class="filter-banner" style="border-color:var(--border);box-shadow:var(--shadow)"><div class="filter-banner-head" style="color:var(--muted)"><i class="bi '+f.icon+'"></i> No trusts match: '+f.label+'<button class="btn" onclick="toggleFilter(\''+activeFilter+'\')" style="margin-left:auto;padding:4px 10px;font-size:12px">Clear <i class="bi bi-x-lg"></i></button></div></div>';
+    document.querySelectorAll('.trust-item.dimmed').forEach(n=>n.classList.remove('dimmed'));
+    return;
+  }
+  banner.innerHTML='<div class="filter-banner"><div class="filter-banner-head"><i class="bi '+f.icon+'"></i> Viewing '+matches.length+' trust(s): '+f.label
+    + '<button class="btn" onclick="toggleFilter(\''+activeFilter+'\')" style="margin-left:auto;padding:4px 10px;font-size:12px">Clear Filter <i class="bi bi-x-lg"></i></button></div>'
+    + '<div class="fb-list">'+matches.map(t=>'<div class="fb-row" onclick="jumpToTrust(\''+encodeURIComponent(t.name)+'\')"><span class="sev-dot '+t.severity+'"></span><span class="nm">'+escapeHtml(t.name)+'</span><span class="cx">'+fctx(activeFilter,t)+'</span><i class="bi bi-chevron-right" style="color:var(--muted)"></i></div>').join('')+'</div></div>';
+  const set=new Set(matches.map(t=>t.name));
+  document.querySelectorAll('.trust-item').forEach(n=>n.classList.toggle('dimmed', !set.has(decodeURIComponent(n.getAttribute('data-name')))));
+}
+function jumpToTrust(enc){
+  const name=decodeURIComponent(enc);
+  document.querySelectorAll('.trust-item.sel').forEach(n=>n.classList.remove('sel'));
+  const esc = (window.CSS && CSS.escape) ? CSS.escape(enc) : enc.replace(/["\\]/g,'\\$&');
+  const item=document.querySelector('.trust-item[data-name="'+esc+'"]');
+  if(item){ item.classList.add('sel'); if(item.scrollIntoView) item.scrollIntoView({behavior:"smooth",block:"center"}); }
+  showDetail(name);
+}
+
+function sevIcon(sev){ return sev==='high'?'bi-exclamation-octagon-fill':sev==='medium'?'bi-exclamation-triangle-fill':sev==='low'?'bi-info-circle-fill':'bi-check-circle-fill'; }
+function renderList(){
+  const el=document.getElementById('trustList');
+  if(!TR.length){ el.innerHTML='<div class="muted-note">No trusts found in this domain.</div>'; return; }
+  const order={high:0,medium:1,low:2,ok:3};
+  const sorted=[...TR].sort((a,b)=>(order[a.severity]-order[b.severity])||a.name.localeCompare(b.name));
+  el.innerHTML = sorted.map(t=>{
+    const dirIcon = t.direction==='Bidirectional'?'bi-arrow-left-right':t.direction==='Inbound'?'bi-box-arrow-in-left':t.direction==='Outbound'?'bi-box-arrow-right':'bi-shuffle';
+    return '<div class="trust-item" data-name="'+encodeURIComponent(t.name)+'" onclick="onItemClick(this,\''+encodeURIComponent(t.name)+'\')">'
+      + '<div class="trust-ico sev-'+t.severity+'"><i class="bi '+sevIcon(t.severity)+'"></i></div>'
+      + '<div class="trust-body"><div class="trust-name">'+escapeHtml(t.name)+'</div>'
+      + '<div class="trust-sub"><span class="dir-pill"><i class="bi '+dirIcon+'"></i> '+escapeHtml(t.direction)+'</span> '+escapeHtml(t.kind)
+      + (t.withinForest?'':(t.sidFiltering?' · <span style="color:var(--green)">SID filter on</span>':' · <span style="color:var(--red)">SID filter off</span>'))+'</div></div>'
+      + '<i class="bi bi-chevron-right" style="color:var(--muted)"></i></div>';
+  }).join('');
+}
+function onItemClick(elm,enc){ document.querySelectorAll('.trust-item.sel').forEach(n=>n.classList.remove('sel')); elm.classList.add('sel'); showDetail(decodeURIComponent(enc)); }
+
+function kv(k,v,cls){ return '<div class="kv"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>'; }
+function boolKV(k,val,goodWhenTrue,goodTxt,badTxt){
+  const good = goodWhenTrue ? val : !val;
+  const txt = val ? (goodTxt||'Yes') : (badTxt||'No');
+  const icon = good ? '<i class="bi bi-check-circle-fill"></i>' : '<i class="bi bi-x-circle-fill"></i>';
+  return kv(k, icon+' '+txt, good?'good':'bad');
+}
+function connKV(c){
+  let cls='mut', icon='bi-dash-circle';
+  if(c==='Reachable'){cls='good';icon='bi-plug-fill';}
+  else if(c==='Unreachable'){cls='warn';icon='bi-plug';}
+  else if(c==='Unavailable'){cls='mut';icon='bi-question-circle';}
+  return kv('Connectivity','<i class="bi '+icon+'"></i> '+c, cls);
+}
+function buildDetailHtml(name){
+  const t=byName[name]; if(!t) return '';
+  const grid = '<div class="kv-grid">'
+    + kv('Partner Domain', escapeHtml(t.partner))
+    + kv('Direction', escapeHtml(t.direction))
+    + kv('Trust Type', escapeHtml(t.trustType))
+    + kv('Classification', escapeHtml(t.kind))
+    + boolKV('Transitive', t.transitive, true, 'Transitive', 'Non-transitive')
+    + connKV(t.connectivity)
+    + '</div>';
+  let secGrid;
+  if(t.withinForest){
+    secGrid = '<div class="muted-note">Intra-forest trust — SID filtering and selective authentication are managed automatically within the forest.</div>';
+  } else {
+    secGrid = '<div class="kv-grid">'
+      + boolKV('SID Filtering', t.sidFiltering, true, 'Enabled (quarantined)', 'DISABLED')
+      + boolKV('Selective Auth', t.selectiveAuth, true, 'Enabled', 'Open (domain-wide)')
+      + boolKV('Forest Transitive', t.forestTransitive, false, 'Yes', 'No')
+      + boolKV('RC4 Permitted', t.usesRC4, false, 'Yes (weak)', 'No')
+      + '</div>';
+  }
+  const lifeGrid = '<div class="kv-grid">'
+    + kv('Created', escapeHtml(t.created||'—'),'mut')
+    + kv('Modified', escapeHtml(t.modified||'—'),'mut')
+    + '</div>';
+  return (
+    '<div class="detail-head"><div class="detail-title"><i class="bi '+sevIcon(t.severity)+'" style="color:var(--'+(t.severity==='ok'?'green':t.severity==='high'?'red':t.severity==='medium'?'amber':'blue')+')"></i>'+escapeHtml(t.name)+'</div>'
+    + '<div class="detail-sub">'+escapeHtml(t.kind)+' · '+escapeHtml(t.direction)+'</div></div>'
+    + '<div class="detail-body">'
+    + '<div class="dsec"><div class="dsec-t"><i class="bi bi-diagram-2"></i> Trust Properties</div>'+grid+'</div>'
+    + '<div class="dsec"><div class="dsec-t"><i class="bi bi-shield-lock"></i> Security Attributes</div>'+secGrid+'</div>'
+    + '<div class="dsec"><div class="dsec-t"><i class="bi bi-clock-history"></i> Lifecycle</div>'+lifeGrid+'</div>'
+    + '</div>');
+}
+function showDetail(name){ var h=buildDetailHtml(name); if(h) document.getElementById('detail').innerHTML=h; }
+function openTrustModal(name){ var h=buildDetailHtml(name); if(!h) return; document.getElementById('modalBody').innerHTML=h; document.getElementById('trustModal').classList.add('open'); }
+function closeTrustModal(){ document.getElementById('trustModal').classList.remove('open'); }
+document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeTrustModal(); });
+
+function filterList(){
+  const q=(document.getElementById('trustSearch').value||'').toLowerCase().trim();
+  document.querySelectorAll('.trust-item').forEach(n=>{
+    const name=decodeURIComponent(n.getAttribute('data-name')).toLowerCase();
+    n.style.display = (!q || name.includes(q)) ? '' : 'none';
+  });
+}
+function toggleTheme(){
+  const isDark = document.body.getAttribute('data-theme')==='dark';
+  document.body.setAttribute('data-theme', isDark?'light':'dark');
+  const btn=document.querySelector('button[onclick="toggleTheme()"]');
+  btn.innerHTML = isDark ? '<i class="bi bi-moon-stars"></i> Theme' : '<i class="bi bi-sun"></i> Theme';
+}
+
+/* ───────── Trust topology: forest triangles + domain rectangles (draggable, pan/zoom) ───────── */
+const GNODES = Array.isArray(D.graphNodes)?D.graphNodes.map(n=>Object.assign({},n)):[];
+const GLINKS = Array.isArray(D.graphLinks)?D.graphLinks:[];
+const DOM_COLORS = { self:'var(--accent)', intraforest:'var(--teal)', forest:'var(--purple)', external:'var(--purple)', realm:'var(--purple)' };
+let gView = { x:0, y:0, k:1 };
+let gSvg, gW=900, gH=480;
+let FORESTS = [];   // [{key,label,isExternal,domains:[node...],x,y,w,h}]
+
+function domColor(t){ return DOM_COLORS[t]||'var(--purple)'; }
+
+// Group nodes into forests; lay forests left→right; stack domains vertically inside each.
+function initGraphLayout(){
+  // Hub-and-spoke: OUR forest on the left (vertically centred), external partner
+  // forests stacked vertically on the right, so each trust line fans out to its
+  // own row instead of overlapping the others.
+  const r=gSvg?gSvg.getBoundingClientRect():{width:900}; gW=r.width||900;
+  const groups={};
+  GNODES.forEach(n=>{ const k=n.forest||n.id; (groups[k]=groups[k]||[]).push(n); });
+  const selfNode = GNODES.find(n=>n.type==='self');
+  const ourKey = selfNode ? selfNode.forest : (Object.keys(groups)[0]||null);
+  const extKeys = Object.keys(groups).filter(k=>k!==ourKey).sort((a,b)=>a.localeCompare(b));
+
+  const DW=150, DH=34, DGAP=14, PADX=26, PADTOP=42, PADBOT=20, FGAPY=30;
+  const fw = DW + PADX*2;
+  const fhOf = doms => doms.length*DH + (doms.length-1)*DGAP + PADTOP + PADBOT;
+  FORESTS = [];
+
+  const ourDoms = groups[ourKey] || [];
+  const leftH = ourDoms.length ? fhOf(ourDoms) : 0;
+  const rightHeights = extKeys.map(k=>fhOf(groups[k]));
+  const rightTotal = rightHeights.reduce((a,h)=>a+h,0) + Math.max(0,extKeys.length-1)*FGAPY;
+  const contentH = Math.max(rightTotal, leftH, 120);
+
+  const topY = 40, leftX = 30;
+  const rightX = leftX + fw + 130;   // wide gap so the fan of links has room
+
+  if(ourDoms.length){
+    const fy = topY + (contentH-leftH)/2;
+    ourDoms.forEach((n,i)=>{ n._w=DW; n._h=DH; n.x=leftX+fw/2; n.y=fy+PADTOP+i*(DH+DGAP)+DH/2; });
+    FORESTS.push({ key:ourKey, label:ourKey+' (this forest)', isExternal:false, domains:ourDoms, x:leftX, y:fy, w:fw, h:leftH });
+  }
+  let y = topY + (contentH-rightTotal)/2;
+  extKeys.forEach((k,idx)=>{
+    const doms=groups[k], h=rightHeights[idx];
+    doms.forEach((n,i)=>{ n._w=DW; n._h=DH; n.x=rightX+fw/2; n.y=y+PADTOP+i*(DH+DGAP)+DH/2; });
+    FORESTS.push({ key:k, label:k, isExternal:true, domains:doms, x:rightX, y:y, w:fw, h:h });
+    y += h + FGAPY;
+  });
+  gH = Math.max(480, topY*2 + contentH);
+}
+
+function linkClass(l){ if(l.severity==='high') return 'risk'; return (l.direction==='Bidirectional')?'bidir':'oneway'; }
+
+// Orthogonal-ish connector between two domain rectangles (side to side), bowed if same column
+function linkPath(s,t){
+  // connect from right/left edge depending on relative position
+  const sRight = t.x>=s.x;
+  const x1 = s.x + (sRight? s._w/2 : -s._w/2);
+  const y1 = s.y;
+  const x2 = t.x + (sRight? -t._w/2 : t._w/2);
+  const y2 = t.y;
+  const mx = (x1+x2)/2;
+  // cubic with horizontal control handles → clean S-curve between rectangles
+  const d = 'M'+x1+','+y1+' C'+mx+','+y1+' '+mx+','+y2+' '+x2+','+y2;
+  return { d, lx:mx, ly:(y1+y2)/2 };
+}
+
+function renderGraph(){
+  gSvg=document.getElementById('graphSvg');
+  const r=gSvg.getBoundingClientRect(); gW=r.width||900; gH=480;
+  if(!GNODES.length){ gSvg.innerHTML='<text x="50%" y="50%" text-anchor="middle" fill="var(--muted)" font-size="13">No trusts to graph.</text>'; return; }
+  if(!FORESTS.length) initGraphLayout();
+  let defs='<defs>'
+    +'<marker id="arrEnd" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="var(--blue)"/></marker>'
+    +'<marker id="arrBoth" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="var(--green)"/></marker>'
+    +'<marker id="arrRisk" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="var(--red)"/></marker>'
+    +'<marker id="arrStart" markerWidth="9" markerHeight="9" refX="1" refY="3" orient="auto"><path d="M8,0 L0,3 L8,6 Z" fill="var(--green)"/></marker>'
+    +'</defs>';
+
+  // Forest triangles (drawn behind). A classic AD forest = triangle enclosing its domains.
+  let forestsSvg='';
+  FORESTS.forEach(f=>{
+    const apexX = f.x + f.w/2, apexY = f.y - 10;
+    const blX = f.x - 6, blY = f.y + f.h + 6;
+    const brX = f.x + f.w + 6, brY = f.y + f.h + 6;
+    forestsSvg += '<g class="forest-group" data-fkey="'+encodeURIComponent(f.key)+'">'
+      + '<polygon class="forest-tri'+(f.isExternal?' ext':'')+'" points="'+apexX+','+apexY+' '+brX+','+brY+' '+blX+','+blY+'"></polygon>'
+      + '<text class="forest-label" x="'+apexX+'" y="'+(apexY-6)+'" text-anchor="middle">'+escapeHtml(f.label.length>30?f.label.slice(0,28)+'…':f.label)+'</text>'
+      + '</g>';
+  });
+
+  // Links between domains
+  let linksSvg='', labelsSvg='';
+  GLINKS.forEach(l=>{
+    let s=GNODES.find(n=>n.id===l.source), t=GNODES.find(n=>n.id===l.target); if(!s||!t) return;
+    const cls=linkClass(l);
+    const marker = cls==='risk'?'url(#arrRisk)':cls==='bidir'?'url(#arrBoth)':'url(#arrEnd)';
+    const startMarker = (l.direction==='Bidirectional')?' marker-start="url(#arrStart)"':'';
+    const p=linkPath(s,t);
+    linksSvg += '<path class="glink '+cls+'" d="'+p.d+'" marker-end="'+marker+'"'+startMarker+'></path>';
+    labelsSvg += '<text class="glink-label" x="'+p.lx+'" y="'+(p.ly-5)+'" text-anchor="middle">'+escapeHtml(l.kind)+'</text>';
+  });
+
+  // Domain rectangles
+  let domsSvg='';
+  GNODES.forEach(n=>{
+    const w=n._w, h=n._h, col=domColor(n.type);
+    const sev=(GLINKS.find(l=>l.target===n.id)||{}).severity;
+    const sevDot = sev==='high'?'<circle cx="'+(w-10)+'" cy="10" r="4" fill="var(--red)"></circle>':sev==='medium'?'<circle cx="'+(w-10)+'" cy="10" r="4" fill="var(--amber)"></circle>':'';
+    const roleTxt = n.type==='self'?'this domain':(n.type==='intraforest'?'domain':'domain');
+    domsSvg += '<g class="dnode" data-id="'+encodeURIComponent(n.id)+'" transform="translate('+(n.x-w/2)+','+(n.y-h/2)+')">'
+      + '<rect width="'+w+'" height="'+h+'" rx="4" fill="var(--surface)" stroke="'+col+'"></rect>'
+      + '<rect width="5" height="'+h+'" rx="2" fill="'+col+'"></rect>'
+      + '<text x="11" y="14" fill="var(--text)">'+escapeHtml(n.label.length>18?n.label.slice(0,16)+'…':n.label)+'</text>'
+      + '<text class="dn-role" x="11" y="26" fill="var(--muted)">'+roleTxt+'</text>'
+      + sevDot
+      + '</g>';
+  });
+
+  gSvg.innerHTML = defs + '<g id="gWorld" transform="translate('+gView.x+','+gView.y+') scale('+gView.k+')">'+forestsSvg+linksSvg+labelsSvg+domsSvg+'</g>';
+  attachGraphInteract();
+}
+
+function applyView(){ const w=document.getElementById('gWorld'); if(w) w.setAttribute('transform','translate('+gView.x+','+gView.y+') scale('+gView.k+')'); }
+
+// Drag/pan/click state lives at module scope so the one-time window listeners can use it.
+let _gi = { dragForest:null, panning:false, last:null, downAt:null, downNodeId:null, moved:false };
+let _giWired = false;
+const DRAG_THRESHOLD = 5;
+function giToWorld(e){ const r=gSvg.getBoundingClientRect(); return { x:(e.clientX-r.left-gView.x)/gView.k, y:(e.clientY-r.top-gView.y)/gView.k }; }
+function attachGraphInteract(){
+  // SVG-level handlers are safe to reassign on each render.
+  gSvg.onmousedown=function(e){
+    _gi.moved=false; _gi.downAt={x:e.clientX,y:e.clientY}; _gi.downNodeId=null; _gi.dragForest=null; _gi.panning=false;
+    const fg=e.target.closest('.forest-group');
+    const dn=e.target.closest('.dnode');
+    if(dn){
+      const id=decodeURIComponent(dn.getAttribute('data-id')); _gi.downNodeId=id;
+      const node=GNODES.find(n=>n.id===id);
+      const f=FORESTS.find(ff=>ff.domains.includes(node));
+      _gi.dragForest=f; const p=giToWorld(e); if(f){ f._ox=p.x; f._oy=p.y; }
+    } else if(fg){
+      const fkey=decodeURIComponent(fg.getAttribute('data-fkey'));
+      _gi.dragForest=FORESTS.find(f=>f.key===fkey);
+      const p=giToWorld(e); if(_gi.dragForest){ _gi.dragForest._ox=p.x; _gi.dragForest._oy=p.y; }
+    } else { _gi.panning=true; _gi.last={x:e.clientX,y:e.clientY}; gSvg.classList.add('grabbing'); }
+  };
+  gSvg.onclick=function(e){ if(_gi.moved){ e.stopPropagation(); e.preventDefault(); } };
+  gSvg.onwheel=function(e){ e.preventDefault(); const r=gSvg.getBoundingClientRect();
+    const mx=e.clientX-r.left, my=e.clientY-r.top; const factor=e.deltaY<0?1.12:0.89;
+    const nk=Math.max(0.3,Math.min(2.5,gView.k*factor));
+    gView.x = mx-(mx-gView.x)*(nk/gView.k); gView.y = my-(my-gView.y)*(nk/gView.k); gView.k=nk; applyView();
+  };
+  // Window-level move/up attach ONCE.
+  if(_giWired) return; _giWired=true;
+  window.addEventListener('mousemove', function(e){
+    const g=_gi;
+    if(g.downAt && (Math.abs(e.clientX-g.downAt.x)>DRAG_THRESHOLD || Math.abs(e.clientY-g.downAt.y)>DRAG_THRESHOLD)) g.moved=true;
+    if(g.dragForest){ const p=giToWorld(e); const dx=p.x-g.dragForest._ox, dy=p.y-g.dragForest._oy;
+      g.dragForest.x+=dx; g.dragForest.y+=dy;
+      g.dragForest.domains.forEach(n=>{ n.x+=dx; n.y+=dy; });
+      g.dragForest._ox=p.x; g.dragForest._oy=p.y;
+      renderGraphPositions();
+    } else if(g.panning){ gView.x+=e.clientX-g.last.x; gView.y+=e.clientY-g.last.y; g.last={x:e.clientX,y:e.clientY}; applyView(); }
+  });
+  window.addEventListener('mouseup', function(e){
+    const g=_gi;
+    if(!g.moved && g.downNodeId){
+      const tr=TR.find(t=>t.partner===g.downNodeId||t.name===g.downNodeId);
+      if(tr){ openTrustModal(tr.name); }
+    }
+    g.dragForest=null; g.panning=false; g.downAt=null; g.downNodeId=null; gSvg.classList.remove('grabbing');
+  });
+}
+
+function renderGraphPositions(){
+  const world=document.getElementById('gWorld'); if(!world) return;
+  // forests
+  world.querySelectorAll('.forest-group').forEach(g=>{
+    const fkey=decodeURIComponent(g.getAttribute('data-fkey')); const f=FORESTS.find(ff=>ff.key===fkey); if(!f) return;
+    const apexX=f.x+f.w/2, apexY=f.y-10, blX=f.x-6, blY=f.y+f.h+6, brX=f.x+f.w+6, brY=f.y+f.h+6;
+    const poly=g.querySelector('polygon'); if(poly) poly.setAttribute('points', apexX+','+apexY+' '+brX+','+brY+' '+blX+','+blY);
+    const lbl=g.querySelector('text'); if(lbl){ lbl.setAttribute('x',apexX); lbl.setAttribute('y',apexY-6); }
+  });
+  // links
+  const paths=world.querySelectorAll('path.glink'); const labels=world.querySelectorAll('text.glink-label'); let li=0;
+  GLINKS.forEach(l=>{ let s=GNODES.find(n=>n.id===l.source), t=GNODES.find(n=>n.id===l.target); if(!s||!t) return;
+    const p=linkPath(s,t); const pa=paths[li]; if(pa) pa.setAttribute('d',p.d); const lb=labels[li]; if(lb){ lb.setAttribute('x',p.lx); lb.setAttribute('y',p.ly-5); } li++;
+  });
+  // domains
+  world.querySelectorAll('.dnode').forEach(g=>{ const id=decodeURIComponent(g.getAttribute('data-id')); const n=GNODES.find(x=>x.id===id); if(!n) return;
+    g.setAttribute('transform','translate('+(n.x-n._w/2)+','+(n.y-n._h/2)+')'); });
+}
+
+function graphReset(){ FORESTS=[]; initGraphLayout(); gView={x:0,y:0,k:1}; renderGraph(); }
+function graphFit(){ gView={x:0,y:0,k:1}; applyView(); }
+
+renderConnNote();
+renderKpis();
+renderDashboard();
+renderList();
+renderGraph();
+window.addEventListener('resize', ()=>{ renderGraph(); });
+</script>
+</body>
+</html>

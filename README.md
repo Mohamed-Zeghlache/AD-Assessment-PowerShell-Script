@@ -14,6 +14,7 @@ Every module is one script. Run it on a domain-joined machine with the AD PowerS
 | **Topology** | \`AD-Topology.ps1\` | Forest → domain → site → DC hierarchy with health, FSMO roles, services, replication links, dcdiag |
 | **DC Inventory** | \`AD-DCInventory.ps1\` | Per-DC inventory plus hardware & performance specs (CPU, RAM, disks, NICs) |
 | **Account Security** | \`AD-AccountSecurity.ps1\` | Password/lockout policy, fine-grained password policies, managed service accounts, LAPS coverage, risky user & computer accounts, krbtgt age |
+| **Trust Relationships** | \`AD-TrustRelationships.ps1\` | Every AD trust with direction/type/transitivity, SID filtering & selective auth posture, connectivity probe, derived risk findings, interactive trust map |
 
 Each module has its own distinct visual design so reports are instantly recognisable.
 
@@ -74,6 +75,18 @@ Credential hygiene across the domain. Scores the default password & lockout poli
 
 ---
 
+## Trust Relationships
+
+![AD Trust Relationships demo](docs/AD-TrustRelationships-demo.gif)
+
+Enumerates every AD trust and assesses its security posture: partner domain, direction (inbound/outbound/bidirectional), trust type (external/forest/realm/parent-child/tree-root), and transitivity, plus SID filtering (quarantine), selective authentication, TGT delegation, and forest-transitive flags. Each trust gets a live connectivity probe (degrading gracefully to "Unavailable / Not tested" in locked-down environments) and derived risk findings — SID filtering disabled on an external/forest trust, selective authentication off, stale trusts, and more. Includes KPI tiles, a filterable trust explorer with detail panel, and an interactive trust map.
+
+\`\`\`powershell
+.\scripts\AD-TrustRelationships.ps1
+\`\`\`
+
+---
+
 ## Common parameters
 
 Every module accepts:
@@ -83,7 +96,7 @@ Every module accepts:
 | \`-OutputPath\` | current directory | Folder to write the HTML report to |
 | \`-OpenReport\` | \`\$true\` | Open the report in the default browser when finished |
 
-Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC Inventory, \`-InactiveDays\`/\`-StaleComputerDays\`/\`-ServiceAccountStalePasswordDays\` on Account Security). Run \`Get-Help .\scripts\<script>.ps1 -Full\` for details.
+Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC Inventory, \`-InactiveDays\`/\`-StaleComputerDays\`/\`-ServiceAccountStalePasswordDays\` on Account Security, \`-TestConnectivity\` on Trust Relationships). Run \`Get-Help .\scripts\<script>.ps1 -Full\` for details.
 
 > **Execution policy:** if a script is blocked, run it for the current process only:
 > \`\`\`powershell
@@ -124,7 +137,7 @@ The reports contain infrastructure and security-posture detail (domain/DC names,
 
 ## Part of a larger project
 
-These four modules are part of an ongoing Active Directory Audit Suite. Additional modules covering other areas of AD health and security are in development and will be published here one by one. The long-term goal is a single orchestrator that runs all modules together and produces a comprehensive combined report.
+These five modules are part of an ongoing Active Directory Audit Suite. Additional modules covering other areas of AD health and security are in development and will be published here one by one. The long-term goal is a single orchestrator that runs all modules together and produces a comprehensive combined report.
 
 Watch or ⭐ the repo to catch new modules as they land.
 
