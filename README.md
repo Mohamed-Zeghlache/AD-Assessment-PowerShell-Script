@@ -15,6 +15,9 @@ Every module is one script. Run it on a domain-joined machine with the AD PowerS
 | **DC Inventory** | \`AD-DCInventory.ps1\` | Per-DC inventory plus hardware & performance specs (CPU, RAM, disks, NICs) |
 | **Account Security** | \`AD-AccountSecurity.ps1\` | Password/lockout policy, fine-grained password policies, managed service accounts, LAPS coverage, risky user & computer accounts, krbtgt age |
 | **Trust Relationships** | \`AD-TrustRelationships.ps1\` | Every AD trust with direction/type/transitivity, SID filtering & selective auth posture, connectivity probe, derived risk findings, interactive trust map |
+| **GPO Policy Analyzer** | \`GPO-PolicyAnalyzer.ps1\` | Backs up every GPO, parses Registry.pol/GptTmpl.inf directly, resolves settings via ADMX/ADML, and flags every setting where GPOs disagree |
+| **DNS Health** | \`AD-DNSHealth.ps1\` | Per-zone/per-server DNS configuration (AD-integration, dynamic updates, aging/scavenging, DNSSEC) plus live per-DC resolution health and lingering DC record detection |
+| **Group & OU Structure** | \`AD-GroupOUStructure.ps1\` | Recursive group-nesting graph with circular-nesting/empty-group/large-group detection, OU hierarchy with per-OU counts and tiering recommendation, and an IDFix scan for Entra ID/M365 sync blockers |
 
 Each module has its own distinct visual design so reports are instantly recognisable.
 
@@ -87,6 +90,40 @@ Enumerates every AD trust and assesses its security posture: partner domain, dir
 
 ---
 
+## GPO Policy Analyzer
+
+Automates what Microsoft's Policy Analyzer does manually. Backs up every GPO in the domain (or a chosen subset) to a local folder, then parses the raw \`Registry.pol\` and \`GptTmpl.inf\` files directly from each backup — no \`Get-GPOReport\`, no RSOP, no repeated AD calls. Registry key/value pairs are resolved to friendly policy names via the same ADMX/ADML definition files GPME uses, pivoted into one comparison table, and any setting where GPOs disagree is flagged — the same "conflict" concept Policy Analyzer highlights in yellow. The export step is the only part that talks to AD/SYSVOL; re-running with \`-SkipExport\` re-analyzes the same backups instantly, even for large GPO counts.
+
+\`\`\`powershell
+.\scripts\GPO-PolicyAnalyzer.ps1
+\`\`\`
+
+---
+
+## DNS Health
+
+![AD DNS Health demo](docs/AD-DNSHealth-demo.gif)
+
+Reviews the DNS that underpins Active Directory from two angles. **Configuration** — per zone and per server: zone type, AD-integration, replication scope, dynamic-update mode, aging/scavenging, zone transfers, DNSSEC signing, and NS records. **Live health** — per domain controller: forward and reverse resolution, forwarder resolution, the DC's own record registration, and (when available) \`dcdiag /test:DNS\`. Stale-record checking is scoped to what actually breaks things — lingering DC records (host A records and \`_msdcs\` SRV/CNAME entries pointing at DCs that no longer exist) — rather than enumerating every record in every zone. Degrades gracefully when the DnsServer module or dcdiag.exe isn't available.
+
+\`\`\`powershell
+.\scripts\AD-DNSHealth.ps1
+\`\`\`
+
+---
+
+## Group & OU Structure
+
+![AD Group & OU Structure demo](docs/AD-GroupOUStructure-demo.gif)
+
+Three sections in one report. **Group nesting** — a security-group membership graph with fully recursive nested-group expansion, circular-nesting detection, empty groups, deep-nesting and large-membership flags; click a group to see its members, like ADUC. **OU structure** — the OU hierarchy with per-OU object counts, empty-OU detection/filter, and a tiering-model recommendation; click an OU to see its direct contents. **IDFix** — a faithful reimplementation of Microsoft IDFix, scanning for attributes that break Entra ID/M365 sync, with click-through to the offending object and the erroring value highlighted. Read-only throughout — detection and suggested fixes only, no writes to AD.
+
+\`\`\`powershell
+.\scripts\AD-GroupOUStructure.ps1
+\`\`\`
+
+---
+
 ## Common parameters
 
 Every module accepts:
@@ -96,7 +133,7 @@ Every module accepts:
 | \`-OutputPath\` | current directory | Folder to write the HTML report to |
 | \`-OpenReport\` | \`\$true\` | Open the report in the default browser when finished |
 
-Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC Inventory, \`-InactiveDays\`/\`-StaleComputerDays\`/\`-ServiceAccountStalePasswordDays\` on Account Security, \`-TestConnectivity\` on Trust Relationships). Run \`Get-Help .\scripts\<script>.ps1 -Full\` for details.
+Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC Inventory, \`-InactiveDays\`/\`-StaleComputerDays\`/\`-ServiceAccountStalePasswordDays\` on Account Security, \`-TestConnectivity\` on Trust Relationships, \`-SkipExport\`/\`-GPONames\` on GPO Policy Analyzer, \`-SkipLiveTests\`/\`-Server\` on DNS Health, \`-DeepNestingThreshold\`/\`-SearchBase\` on Group & OU Structure). Run \`Get-Help .\scripts\<script>.ps1 -Full\` for details.
 
 > **Execution policy:** if a script is blocked, run it for the current process only:
 > \`\`\`powershell
@@ -116,11 +153,13 @@ Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC 
 
 For the richest per-DC detail (Topology and DC Inventory), the running account should be able to reach the DCs via **WinRM** or **WMI/DCOM**. When a DC can't be reached, the report degrades gracefully and shows the fields it could not collect as *unavailable* rather than failing.
 
+**GPO Policy Analyzer** additionally requires the **GroupPolicy** module (RSAT-GPMC) to back up GPOs, and read access to SYSVOL. **DNS Health** benefits from the **DnsServer** module (RSAT-DNS) for full zone/server detail, but degrades to AD-only checks without it.
+
 ---
 
 ## Sample reports
 
-The [\`examples/\`](examples/) folder contains a sample HTML report for each module, built from **fictional data** (\`corp.local\`). Open any of them in a browser to explore the interactive features without running anything.
+The [\`examples/\`](examples/) folder contains a sample HTML report for each module, built from **fictional data** (\`corp.local\`, \`contoso.lab\`, etc.). Open any of them in a browser to explore the interactive features without running anything.
 
 ---
 
@@ -137,7 +176,7 @@ The reports contain infrastructure and security-posture detail (domain/DC names,
 
 ## Part of a larger project
 
-These five modules are part of an ongoing Active Directory Audit Suite. Additional modules covering other areas of AD health and security are in development and will be published here one by one. The long-term goal is a single orchestrator that runs all modules together and produces a comprehensive combined report.
+These eight modules are part of an ongoing Active Directory Audit Suite. Additional modules covering other areas of AD health and security are in development and will be published here one by one. The long-term goal is a single orchestrator that runs all modules together and produces a comprehensive combined report.
 
 Watch or ⭐ the repo to catch new modules as they land.
 

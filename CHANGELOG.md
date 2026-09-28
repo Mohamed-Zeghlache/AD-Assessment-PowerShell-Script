@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.0] — 2026-09-28
+
+### Added
+- **GPO Policy Analyzer** (\`GPO-PolicyAnalyzer.ps1\`) — new module that backs up every GPO in the domain, parses \`Registry.pol\`/\`GptTmpl.inf\` directly from the backups (no \`Get-GPOReport\`, no RSOP), resolves settings to friendly names via ADMX/ADML, and pivots everything into one comparison grid that flags any setting where GPOs disagree. \`-SkipExport\` re-analyzes existing backups instantly.
+- **DNS Health** (\`AD-DNSHealth.ps1\`) — new module reviewing DNS configuration (zone type, AD-integration, dynamic updates, aging/scavenging, zone transfers, DNSSEC, NS records) per zone and per server, plus live per-DC resolution health (forward/reverse/forwarder resolution, record registration, \`dcdiag /test:DNS\`) and lingering DC record detection.
+- **Group & OU Structure** (\`AD-GroupOUStructure.ps1\`) — new module combining a recursive group-nesting graph (circular-nesting, empty-group, deep-nesting, large-membership detection), an OU hierarchy view with per-OU counts and a tiering-model recommendation, and an IDFix reimplementation that scans for attributes breaking Entra ID/M365 sync.
+
 ## [1.3.0] — 2026-08-08
 
 ### Added
