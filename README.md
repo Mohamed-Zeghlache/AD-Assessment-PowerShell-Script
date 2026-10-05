@@ -92,6 +92,8 @@ Enumerates every AD trust and assesses its security posture: partner domain, dir
 
 ## GPO Policy Analyzer
 
+![AD GPO Policy Analyzer demo](docs/GPO-PolicyAnalyzer-demo.gif)
+
 Automates what Microsoft's Policy Analyzer does manually. Backs up every GPO in the domain (or a chosen subset) to a local folder, then parses the raw \`Registry.pol\` and \`GptTmpl.inf\` files directly from each backup — no \`Get-GPOReport\`, no RSOP, no repeated AD calls. Registry key/value pairs are resolved to friendly policy names via the same ADMX/ADML definition files GPME uses, pivoted into one comparison table, and any setting where GPOs disagree is flagged — the same "conflict" concept Policy Analyzer highlights in yellow. The export step is the only part that talks to AD/SYSVOL; re-running with \`-SkipExport\` re-analyzes the same backups instantly, even for large GPO counts.
 
 \`\`\`powershell
