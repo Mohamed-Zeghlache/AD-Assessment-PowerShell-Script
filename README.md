@@ -18,6 +18,7 @@ Every module is one script. Run it on a domain-joined machine with the AD PowerS
 | **GPO Policy Analyzer** | \`GPO-PolicyAnalyzer.ps1\` | Backs up every GPO, parses Registry.pol/GptTmpl.inf directly, resolves settings via ADMX/ADML, and flags every setting where GPOs disagree |
 | **DNS Health** | \`AD-DNSHealth.ps1\` | Per-zone/per-server DNS configuration (AD-integration, dynamic updates, aging/scavenging, DNSSEC) plus live per-DC resolution health and lingering DC record detection |
 | **Group & OU Structure** | \`AD-GroupOUStructure.ps1\` | Recursive group-nesting graph with circular-nesting/empty-group/large-group detection, OU hierarchy with per-OU counts and tiering recommendation, and an IDFix scan for Entra ID/M365 sync blockers |
+| **DC Posture** | \`AD-DCPosture.ps1\` | Per-DC protocol/hardening checks (LDAP signing, SMB signing, NTLM, Kerberos encryption, etc.), security events (lockouts, failed logons, password spray), time-sync hierarchy, backup/recovery readiness, and Windows Server 2025 / AES-key readiness |
 
 Each module has its own distinct visual design so reports are instantly recognisable.
 
@@ -70,7 +71,7 @@ Per-DC inventory plus deep hardware and performance detail. KPI cards for online
 
 ![AD Account Security demo](docs/AccountSecurity-demo.png)
 
-Credential hygiene across the domain. Scores the default password & lockout policy against a recommended baseline, lists fine-grained password policies (PSOs) with precedence and who they apply to, inventories managed service accounts (gMSA/sMSA) and LAPS coverage (Windows and Legacy), and flags risky accounts — password-never-expires, password-not-required, unconstrained delegation, SID history, inactive-but-enabled users, stale service-account passwords, stale/legacy/EOL-OS computers — plus krbtgt password age. Long lists stay off the main page behind per-category **Open** (full-page view) and **CSV download** actions so a large tenant stays readable. Optional sources (LAPS schema, KDS root key, etc.) degrade gracefully to "Not available" instead of failing.
+Credential hygiene across the domain. Scores the default password & lockout policy against a recommended baseline, lists fine-grained password policies (PSOs) with precedence and who they apply to, inventories managed service accounts (gMSA/sMSA) and LAPS coverage (Windows and Legacy), and flags risky accounts — password-never-expires, password-not-required, unconstrained delegation, SID history, inactive-but-enabled users, stale service-account passwords, accounts (and krbtgt) with no AES keys because their password predates AES support, stale/legacy/EOL-OS computers — plus krbtgt password age. Long lists stay off the main page behind per-category **Open** (full-page view) and **CSV download** actions so a large tenant stays readable. Optional sources (LAPS schema, KDS root key, etc.) degrade gracefully to "Not available" instead of failing.
 
 \`\`\`powershell
 .\scripts\AD-AccountSecurity.ps1
@@ -94,7 +95,7 @@ Enumerates every AD trust and assesses its security posture: partner domain, dir
 
 ![AD GPO Policy Analyzer demo](docs/GPO-PolicyAnalyzer-demo.gif)
 
-Automates what Microsoft's Policy Analyzer does manually. Backs up every GPO in the domain (or a chosen subset) to a local folder, then parses the raw \`Registry.pol\` and \`GptTmpl.inf\` files directly from each backup — no \`Get-GPOReport\`, no RSOP, no repeated AD calls. Registry key/value pairs are resolved to friendly policy names via the same ADMX/ADML definition files GPME uses, pivoted into one comparison table, and any setting where GPOs disagree is flagged — the same "conflict" concept Policy Analyzer highlights in yellow. The export step is the only part that talks to AD/SYSVOL; re-running with \`-SkipExport\` re-analyzes the same backups instantly, even for large GPO counts.
+Automates what Microsoft's Policy Analyzer does manually. Backs up every GPO in the domain (or a chosen subset) to a local folder, then parses the raw \`Registry.pol\` and \`GptTmpl.inf\` files directly from each backup — no \`Get-GPOReport\`, no RSOP, no repeated AD calls. Registry key/value pairs are resolved to friendly policy names via the same ADMX/ADML definition files GPME uses, pivoted into one comparison table, and any setting where GPOs disagree is flagged — the same "conflict" concept Policy Analyzer highlights in yellow. Conflicts are also checked against **WMI filters**: if one of the disagreeing GPOs only applies when its WQL query is true, the report notes that the "conflict" may never actually reach the same computer. The export step is the only part that talks to AD/SYSVOL; re-running with \`-SkipExport\` re-analyzes the same backups instantly, even for large GPO counts.
 
 \`\`\`powershell
 .\scripts\GPO-PolicyAnalyzer.ps1
@@ -126,6 +127,18 @@ Three sections in one report. **Group nesting** — a security-group membership 
 
 ---
 
+## DC Posture
+
+![AD DC Posture demo](docs/AD-DCPosture-demo.gif)
+
+Domain-controller hardening and operational readiness in five areas. **Protocols & hardening** — per DC: LDAP signing, LDAP channel binding, LDAPS certificate, NTLM level/auditing, LM hash storage, SMB signing, SMBv1, SSL/TLS versions, LLMNR, NetBIOS, WDigest, LSA protection, Kerberos encryption types, Print Spooler, plus DES-only accounts domain-wide. **Security events** (last N days, every DC) — lockouts (4740), failed logons (4625) with password-spray detection, Kerberos pre-auth failures (4771), privileged group changes, cleared audit logs (1102), and unsigned/clear-text LDAP binds with the offending clients. **Time sync hierarchy** — configured type/NTP server, actual source, offset vs the PDC, Hyper-V time provider. **Backup & recovery readiness** — AD Recycle Bin, tombstone lifetime, last backup per partition, SYSVOL replication (DFSR vs FRS). **Windows Server 2025 / AES readiness** — functional levels, DC versions, SYSVOL on DFSR, krbtgt/service accounts without AES keys, RC4/DES-only accounts, legacy and non-Windows systems, Exchange versions. Registry values are read over CIM/DCOM (no WinRM needed); event logs over RPC. Unreachable DCs are reported, never waited on.
+
+\`\`\`powershell
+.\scripts\AD-DCPosture.ps1
+\`\`\`
+
+---
+
 ## Common parameters
 
 Every module accepts:
@@ -135,7 +148,7 @@ Every module accepts:
 | \`-OutputPath\` | current directory | Folder to write the HTML report to |
 | \`-OpenReport\` | \`\$true\` | Open the report in the default browser when finished |
 
-Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC Inventory, \`-InactiveDays\`/\`-StaleComputerDays\`/\`-ServiceAccountStalePasswordDays\` on Account Security, \`-TestConnectivity\` on Trust Relationships, \`-SkipExport\`/\`-GPONames\` on GPO Policy Analyzer, \`-SkipLiveTests\`/\`-Server\` on DNS Health, \`-DeepNestingThreshold\`/\`-SearchBase\` on Group & OU Structure). Run \`Get-Help .\scripts\<script>.ps1 -Full\` for details.
+Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC Inventory, \`-InactiveDays\`/\`-StaleComputerDays\`/\`-ServiceAccountStalePasswordDays\` on Account Security, \`-TestConnectivity\` on Trust Relationships, \`-SkipExport\`/\`-GPONames\` on GPO Policy Analyzer, \`-SkipLiveTests\`/\`-Server\` on DNS Health, \`-DeepNestingThreshold\`/\`-SearchBase\` on Group & OU Structure, \`-EventDays\`/\`-SkipEvents\`/\`-SkipTime\` on DC Posture). Run \`Get-Help .\scripts\<script>.ps1 -Full\` for details.
 
 > **Execution policy:** if a script is blocked, run it for the current process only:
 > \`\`\`powershell
@@ -155,7 +168,7 @@ Some modules add their own (\`-StaleDays\` on Overview, \`-SkipHardware\` on DC 
 
 For the richest per-DC detail (Topology and DC Inventory), the running account should be able to reach the DCs via **WinRM** or **WMI/DCOM**. When a DC can't be reached, the report degrades gracefully and shows the fields it could not collect as *unavailable* rather than failing.
 
-**GPO Policy Analyzer** additionally requires the **GroupPolicy** module (RSAT-GPMC) to back up GPOs, and read access to SYSVOL. **DNS Health** benefits from the **DnsServer** module (RSAT-DNS) for full zone/server detail, but degrades to AD-only checks without it.
+**GPO Policy Analyzer** additionally requires the **GroupPolicy** module (RSAT-GPMC) to back up GPOs, and read access to SYSVOL. **DNS Health** benefits from the **DnsServer** module (RSAT-DNS) for full zone/server detail, but degrades to AD-only checks without it. **DC Posture** reads registry values over CIM/DCOM and security event logs over RPC on every DC, so run it as a domain admin, or with Event Log Readers plus remote registry read granted on the DCs.
 
 ---
 
@@ -178,7 +191,7 @@ The reports contain infrastructure and security-posture detail (domain/DC names,
 
 ## Part of a larger project
 
-These eight modules are part of an ongoing Active Directory Audit Suite. Additional modules covering other areas of AD health and security are in development and will be published here one by one. The long-term goal is a single orchestrator that runs all modules together and produces a comprehensive combined report.
+These nine modules are part of an ongoing Active Directory Audit Suite. Additional modules covering other areas of AD health and security are in development and will be published here one by one. The long-term goal is a single orchestrator that runs all modules together and produces a comprehensive combined report.
 
 Watch or ⭐ the repo to catch new modules as they land.
 

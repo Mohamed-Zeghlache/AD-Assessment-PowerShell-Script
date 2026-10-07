@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.0] — 2026-10-07
+
+### Added
+- **DC Posture** (\`AD-DCPosture.ps1\`) — new module covering per-DC protocol/hardening checks (LDAP signing & channel binding, LDAPS certificate, NTLM level/auditing, LM hash storage, SMB signing/SMBv1, SSL/TLS versions, LLMNR, NetBIOS, WDigest, LSA protection, Kerberos encryption types, Print Spooler, DES-only accounts), security events over the last N days (lockouts, failed logons with password-spray detection, Kerberos pre-auth failures, privileged group changes, cleared audit logs, unsigned/clear-text LDAP binds), time-sync hierarchy, backup & recovery readiness (Recycle Bin, tombstone lifetime, last backup, SYSVOL replication), and Windows Server 2025 / AES-key readiness. Reads registry over CIM/DCOM and event logs over RPC; no WinRM required.
+- **Account Security**: flags accounts (and krbtgt) with no AES keys because their password predates the domain's AES support — relevant to the Kerberos AES-only hardening (CVE-2026-20833).
+- **GPO Policy Analyzer**: conflicts are now cross-checked against WMI filters — if a disagreeing GPO only applies when its WQL query is true, the report notes the conflict may never reach the same computer.
+
+### Fixed
+- **DC Inventory, Topology, DNS Health**: DC/host reachability no longer relies on ICMP ping alone (often blocked on domain controllers) — falls back to probing core DC/DNS ports (389/88/135/445/9389, or 53/389/88/135/445 for DNS). DC Inventory and Topology relabel "Online/Offline" as "Reachable/Unreachable" to match.
+
 ## [1.4.0] — 2026-09-28
 
 ### Added
