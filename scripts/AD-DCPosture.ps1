@@ -1,0 +1,1323 @@
+﻿<#
+.SYNOPSIS
+    AD DC Posture - domain controller hardening, security events, time sync, backup and Windows Server 2025 readiness (interactive HTML report).
+
+.DESCRIPTION
+    Standalone module for the Active Directory Audit Suite. One self-contained,
+    offline, interactive HTML report (light/dark) covering five areas:
+
+      1. PROTOCOLS & HARDENING (per domain controller)
+           LDAP signing, LDAP channel binding, LDAPS certificate, NTLM level,
+           NTLM auditing, LM hash storage, SMB signing, SMBv1, SSL/TLS versions,
+           LLMNR, NetBIOS, WDigest, LSA protection, Kerberos encryption types,
+           Print Spooler on DCs, plus DES-only accounts domain-wide.
+      2. SECURITY EVENTS (last N days, every DC)
+           Lockouts (4740), failed logons (4625) incl. password-spray detection,
+           Kerberos pre-auth failures (4771), privileged group changes,
+           audit log cleared (1102), and unsigned / clear-text LDAP binds
+           (2887 / 2889) with the list of offending clients.
+      3. TIME SYNC HIERARCHY
+           Configured type and NTP server, actual source, offset vs the PDC,
+           Hyper-V time provider.
+      4. BACKUP & RECOVERY READINESS
+           AD Recycle Bin, tombstone lifetime, last backup per partition,
+           SYSVOL replication (DFSR vs FRS).
+      5. WINDOWS SERVER 2025 READINESS
+           Functional levels, DC versions forest-wide, SYSVOL on DFSR, krbtgt and
+           service accounts without AES keys, RC4/DES-only accounts, users with
+           pre-AES passwords, legacy and non-Windows systems, Exchange versions.
+
+    READ-ONLY. Registry values are read over CIM/DCOM (no WinRM needed);
+    event logs over RPC. Unreachable DCs are reported, never waited on.
+
+.PARAMETER OutputPath       Folder for the HTML report (default: current dir).
+.PARAMETER EventDays        How many days of security events to analyse (default 7).
+.PARAMETER MaxEventsPerDc   Cap per event query per DC (default 5000, newest first).
+.PARAMETER SkipEvents       Skip event log collection.
+.PARAMETER SkipTime         Skip w32tm time-source and offset checks.
+.PARAMETER OpenReport       Open the report when done (default: $true).
+
+.NOTES
+    Author  : Mohamed ZEGHLACHE
+    Project : Active Directory Audit Suite
+    Requires: ActiveDirectory module (RSAT-AD-PowerShell). Run as a domain admin
+              (or with Event Log Readers + remote registry read on DCs).
+#>
+[CmdletBinding()]
+param(
+    [string]$OutputPath = (Get-Location).Path,
+    [int]$EventDays = 7,
+    [int]$MaxEventsPerDc = 5000,
+    [switch]$SkipEvents,
+    [switch]$SkipTime,
+    [switch]$OpenReport = $true
+)
+
+$ErrorActionPreference = 'Stop'
+try { Import-Module ActiveDirectory -ErrorAction Stop } catch { Write-Error "ActiveDirectory module not available. Install RSAT-AD-PowerShell."; exit 1 }
+try { $OutputPath = [System.IO.Path]::GetFullPath($OutputPath) } catch {}
+if (!(Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+$Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'; $GeneratedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+try { $Domain = Get-ADDomain -ErrorAction Stop } catch { Write-Error "Could not contact the domain: $($_.Exception.Message)"; exit 1 }
+try { $Forest = Get-ADForest -ErrorAction SilentlyContinue } catch { $Forest = $null }
+$DomainDNS = [string]$Domain.DNSRoot
+$ForestDNS = if ($Forest) { [string]$Forest.Name } else { $DomainDNS }
+$DomainDN  = [string]$Domain.DistinguishedName
+$PdcName   = [string]$Domain.PDCEmulator
+$ReportPath = Join-Path $OutputPath "AD_DCPosture_$Stamp.html"
+
+Write-Host "AD DC Posture" -ForegroundColor Cyan
+Write-Host "=============" -ForegroundColor Cyan
+Write-Host "build: v14" -ForegroundColor DarkGray
+Write-Host "Domain: $DomainDNS   PDC: $PdcName" -ForegroundColor Gray
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers (PS 5.1-safe: hashtables, ArrayList, no pscustomobject in data)
+# ─────────────────────────────────────────────────────────────────────────────
+$HKLM = [uint32]2147483650
+function Test-Port {
+    param([string]$ComputerName,[int]$Port,[int]$TimeoutMs=1500)
+    $c = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $iar = $c.BeginConnect($ComputerName,$Port,$null,$null)
+        if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs,$false) -and $c.Connected) { $c.EndConnect($iar); return $true }
+        return $false
+    } catch { return $false } finally { $c.Close() }
+}
+function New-DcCimSession {
+    param([string]$Name)
+    if (Test-Port -ComputerName $Name -Port 135 -TimeoutMs 1500) {
+        try { $opt = New-CimSessionOption -Protocol Dcom; return New-CimSession -ComputerName $Name -SessionOption $opt -OperationTimeoutSec 15 -ErrorAction Stop } catch {}
+    }
+    if (Test-Port -ComputerName $Name -Port 5985 -TimeoutMs 1500) {
+        try { return New-CimSession -ComputerName $Name -OperationTimeoutSec 15 -ErrorAction Stop } catch {}
+    }
+    return $null
+}
+function Get-RegDword { param($S,[string]$Key,[string]$Name)
+    try {
+        $r = Invoke-CimMethod -CimSession $S -Namespace 'root/default' -ClassName 'StdRegProv' -MethodName 'GetDWORDValue' -Arguments @{ hDefKey=$HKLM; sSubKeyName=$Key; sValueName=$Name } -ErrorAction Stop
+        if ([int]$r.ReturnValue -eq 0 -and $null -ne $r.uValue) { return [int64]$r.uValue }
+    } catch {}
+    return $null
+}
+function Get-RegString { param($S,[string]$Key,[string]$Name)
+    try {
+        $r = Invoke-CimMethod -CimSession $S -Namespace 'root/default' -ClassName 'StdRegProv' -MethodName 'GetStringValue' -Arguments @{ hDefKey=$HKLM; sSubKeyName=$Key; sValueName=$Name } -ErrorAction Stop
+        if ([int]$r.ReturnValue -eq 0 -and $null -ne $r.sValue) { return [string]$r.sValue }
+    } catch {}
+    return $null
+}
+function Test-RegKey { param($S,[string]$Key)
+    try { $r = Invoke-CimMethod -CimSession $S -Namespace 'root/default' -ClassName 'StdRegProv' -MethodName 'EnumKey' -Arguments @{ hDefKey=$HKLM; sSubKeyName=$Key } -ErrorAction Stop; return ([int]$r.ReturnValue -eq 0) } catch { return $false }
+}
+function Fmt-Date { param($D) if ($D) { try { return ([datetime]$D).ToString('yyyy-MM-dd HH:mm') } catch { return '' } } return '' }
+# A single evaluated setting for one DC.
+function New-Setting { param([string]$Id,[string]$Value,[string]$Sev,[string]$Title,[string]$Advice)
+    @{ id=$Id; value=$Value; sev=$Sev; title=$Title; advice=$Advice } }
+# Sort helper without Sort-Object: fills $Out in place, ordered by string key.
+function Fill-Sorted { param([System.Collections.ArrayList]$Items,[System.Collections.ArrayList]$Keys,[System.Collections.ArrayList]$Out)
+    $map=@{}; $keyArr = [string[]]::new($Keys.Count)
+    for ($i=0; $i -lt $Keys.Count; $i++) { $k = ([string]$Keys[$i]) + '|' + $i.ToString('D6'); $keyArr[$i]=$k; $map[$k]=$Items[$i] }
+    [System.Array]::Sort($keyArr)
+    foreach ($k in $keyArr) { [void]$Out.Add($map[$k]) }
+}
+function CountKey { param([int]$N,[string]$Name) (999999999 - $N).ToString('D9') + ([string]$Name).ToLower() }
+
+# LDAPS: connect to 636 from this host and read the certificate.
+function Test-Ldaps { param([string]$HostName)
+    $res = @{ listening=$false; subject=''; issuer=''; expires=''; days=$null; error='' }
+    $tcp = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $iar = $tcp.BeginConnect($HostName,636,$null,$null)
+        if ((-not $iar.AsyncWaitHandle.WaitOne(2000,$false)) -or (-not $tcp.Connected)) { $res['error'] = 'Port 636 not reachable'; return $res }
+        $tcp.EndConnect($iar); $res['listening'] = $true
+        $tcp.ReceiveTimeout = 5000; $tcp.SendTimeout = 5000
+        $cb = [System.Net.Security.RemoteCertificateValidationCallback]{ param($a,$b,$c,$d) $true }
+        $ssl = [System.Net.Security.SslStream]::new($tcp.GetStream(), $false, $cb)
+        try {
+            $protos = [System.Security.Authentication.SslProtocols]::Tls12 -bor [System.Security.Authentication.SslProtocols]::Tls11 -bor [System.Security.Authentication.SslProtocols]::Tls
+            $ssl.AuthenticateAsClient($HostName, $null, $protos, $false)
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($ssl.RemoteCertificate)
+            $res['subject'] = [string]$cert.Subject; $res['issuer'] = [string]$cert.Issuer
+            $res['expires'] = $cert.NotAfter.ToString('yyyy-MM-dd')
+            $res['days'] = [int][math]::Floor(($cert.NotAfter - (Get-Date)).TotalDays)
+        } finally { $ssl.Dispose() }
+    } catch { $res['error'] = [string]$_.Exception.Message } finally { $tcp.Close() }
+    return $res
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Domain controllers
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Host "[1/6] Enumerating domain controllers..." -ForegroundColor Yellow
+$dcObjs = @(Get-ADDomainController -Filter *)
+$DcList = [System.Collections.ArrayList]::new()
+$DcKeys = [System.Collections.ArrayList]::new()
+foreach ($d in $dcObjs) {
+    $name = [string]$d.HostName
+    $short = ($name -split '\.')[0].ToUpper()
+    $os = [string]$d.OperatingSystem
+    $build = 0; try { $build = [int](([string]$d.OperatingSystemVersion) -replace '^.*\((\d+)\).*$','$1') } catch {}
+    [void]$DcList.Add(@{ name=$name; short=$short; site=[string]$d.Site; ip=[string]$d.IPv4Address; os=$os; build=$build;
+        isPdc=[bool]($name -eq $PdcName); rodc=[bool]$d.IsReadOnly; reachable=$false; regRead=$false; platform='Unknown'; model=''; settings=[System.Collections.ArrayList]::new();
+        ldaps=@{}; time=@{}; notes=[System.Collections.ArrayList]::new() })
+    $pk = if ($name -eq $PdcName) { '0' } else { '1' }
+    [void]$DcKeys.Add($pk + $short)
+}
+$DCS = [System.Collections.ArrayList]::new(); Fill-Sorted -Items $DcList -Keys $DcKeys -Out $DCS
+Write-Host "  $($DCS.Count) domain controller(s)" -ForegroundColor Gray
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Protocols & hardening (per DC)
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Host "[2/6] Reading protocol and hardening settings..." -ForegroundColor Yellow
+$kNtds   = 'SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
+$kLsa    = 'SYSTEM\CurrentControlSet\Control\Lsa'
+$kMsv    = 'SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'
+$kNetlog = 'SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
+$kSmb    = 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+$kSchan  = 'SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
+$kDnsC   = 'SOFTWARE\Policies\Microsoft\Windows NT\DNSClient'
+$kWd     = 'SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest'
+$kKerb   = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'
+$kW32    = 'SYSTEM\CurrentControlSet\Services\W32Time'
+
+foreach ($dc in $DCS) {
+  $n = $dc['name']
+  Write-Host "  $($dc['short'])..." -ForegroundColor DarkGray
+  try {
+    # LDAPS is tested from this host (does not need registry access)
+    $l = Test-Ldaps -HostName $n
+    $dc['ldaps'] = $l
+    if (-not $l['listening']) { [void]$dc['settings'].Add((New-Setting 'ldaps' 'Not listening on 636' 'warn' 'LDAPS not available' 'Enroll a domain controller certificate (Kerberos Authentication or Domain Controller Authentication template) so LDAPS is available before enforcing LDAP signing.')) }
+    elseif ($null -eq $l['days']) { [void]$dc['settings'].Add((New-Setting 'ldaps' 'Handshake failed' 'warn' 'LDAPS certificate could not be read' 'Check that the domain controller has a valid server authentication certificate.')) }
+    elseif ([int]$l['days'] -lt 0) { [void]$dc['settings'].Add((New-Setting 'ldaps' ("Expired " + $l['expires']) 'crit' 'LDAPS certificate expired' 'Renew the domain controller certificate; LDAPS clients will fail until it is replaced.')) }
+    elseif ([int]$l['days'] -lt 30) { [void]$dc['settings'].Add((New-Setting 'ldaps' ("Expires " + $l['expires']) 'warn' 'LDAPS certificate expires within 30 days' 'Renew the domain controller certificate before it expires.')) }
+    else { [void]$dc['settings'].Add((New-Setting 'ldaps' ("Valid until " + $l['expires']) 'ok' 'LDAPS certificate valid' '')) }
+
+    $s = New-DcCimSession -Name $n
+    if (-not $s) { [void]$dc['notes'].Add('Remote management (DCOM/WinRM) not reachable - registry settings were not read.'); continue }
+    $dc['reachable'] = $true
+    try {
+      $probe = Get-RegString $s 'SYSTEM\CurrentControlSet\Control\ProductOptions' 'ProductType'
+      if ($null -eq $probe) { [void]$dc['notes'].Add('Registry could not be read (StdRegProv access denied?).') }
+      else {
+        $dc['regRead'] = $true
+        # LDAP signing
+        $v = Get-RegDword $s $kNtds 'LDAPServerIntegrity'
+        if ($v -eq 2) { [void]$dc['settings'].Add((New-Setting 'ldapSign' 'Required' 'ok' 'LDAP signing required' '')) }
+        elseif ($v -eq 0) { [void]$dc['settings'].Add((New-Setting 'ldapSign' 'None' 'crit' 'LDAP signing disabled' 'Set the domain controller LDAP server signing requirement to at least negotiate, then to require once unsigned clients are fixed.')) }
+        else { [void]$dc['settings'].Add((New-Setting 'ldapSign' 'Negotiated (not required)' 'warn' 'LDAP signing not required' 'Require LDAP signing on domain controllers once the clients listed under Security events > Unsigned LDAP binds are fixed.')) }
+        # LDAP channel binding
+        $v = Get-RegDword $s $kNtds 'LdapEnforceChannelBinding'
+        if ($v -eq 2) { [void]$dc['settings'].Add((New-Setting 'ldapCbt' 'Always' 'ok' 'LDAP channel binding enforced' '')) }
+        elseif ($v -eq 1) { [void]$dc['settings'].Add((New-Setting 'ldapCbt' 'When supported' 'warn' 'LDAP channel binding not enforced' 'Move LDAP channel binding to Always once all LDAPS clients support it.')) }
+        elseif ($v -eq 0) { [void]$dc['settings'].Add((New-Setting 'ldapCbt' 'Never' 'warn' 'LDAP channel binding disabled' 'Enable LDAP channel binding (When supported first, then Always).')) }
+        else { [void]$dc['settings'].Add((New-Setting 'ldapCbt' 'Not configured' 'warn' 'LDAP channel binding not configured' 'Configure LDAP channel binding explicitly (When supported first, then Always) rather than relying on the OS default.')) }
+        # NTLM level
+        $v = Get-RegDword $s $kLsa 'LmCompatibilityLevel'
+        $lv = if ($null -eq $v) { 3 } else { [int]$v }
+        $lvTxt = if ($null -eq $v) { 'Not set (default 3)' } else { "Level $lv" }
+        if ($lv -ge 5) { [void]$dc['settings'].Add((New-Setting 'ntlmLevel' $lvTxt 'ok' 'Only NTLMv2 accepted' '')) }
+        elseif ($lv -le 2) { [void]$dc['settings'].Add((New-Setting 'ntlmLevel' $lvTxt 'crit' 'LM/NTLMv1 sent and accepted' 'Raise the LAN Manager authentication level to "Send NTLMv2 response only. Refuse LM & NTLM" after confirming no NTLMv1 clients remain.')) }
+        else { [void]$dc['settings'].Add((New-Setting 'ntlmLevel' $lvTxt 'warn' 'DC still accepts LM/NTLMv1' 'Raise the LAN Manager authentication level to "Send NTLMv2 response only. Refuse LM & NTLM" after confirming no NTLMv1 clients remain.')) }
+        # NTLM auditing / restriction
+        $au = Get-RegDword $s $kNetlog 'AuditNTLMInDomain'; $re = Get-RegDword $s $kNetlog 'RestrictNTLMInDomain'
+        if ($re -and $re -gt 0) { [void]$dc['settings'].Add((New-Setting 'ntlmAudit' "Restricted (level $re)" 'ok' 'NTLM restricted in domain' '')) }
+        elseif ($au -and $au -gt 0) { [void]$dc['settings'].Add((New-Setting 'ntlmAudit' "Auditing (level $au)" 'ok' 'NTLM auditing enabled' '')) }
+        else { [void]$dc['settings'].Add((New-Setting 'ntlmAudit' 'Off' 'info' 'NTLM usage not audited' 'Enable NTLM auditing on domain controllers to see which clients still use NTLM before restricting it.')) }
+        # LM hash storage
+        $v = Get-RegDword $s $kLsa 'NoLMHash'
+        if ($v -eq 1 -or $null -eq $v) { [void]$dc['settings'].Add((New-Setting 'noLm' $(if ($null -eq $v) { 'Default (not stored)' } else { 'Not stored' }) 'ok' 'LM hashes not stored' '')) }
+        else { [void]$dc['settings'].Add((New-Setting 'noLm' 'Stored' 'crit' 'LM hashes stored' 'Turn on "Do not store LAN Manager hash value on next password change", then have affected accounts change their passwords.')) }
+        # SMB signing
+        $v = Get-RegDword $s $kSmb 'RequireSecuritySignature'
+        if ($v -eq 1) { [void]$dc['settings'].Add((New-Setting 'smbSign' 'Required' 'ok' 'SMB signing required' '')) }
+        else { [void]$dc['settings'].Add((New-Setting 'smbSign' $(if ($null -eq $v) { 'Not set' } else { 'Not required' }) 'crit' 'SMB signing not required' 'Require SMB signing on domain controllers (Default Domain Controllers Policy) to block NTLM relay against them.')) }
+        # SMBv1
+        $v = Get-RegDword $s $kSmb 'SMB1'
+        $smb1On = $null
+        try { $f = @(Get-CimInstance -CimSession $s -ClassName Win32_OptionalFeature -Filter "Name='SMB1Protocol'" -ErrorAction Stop); if ($f.Count) { $smb1On = ([int]$f[0].InstallState -eq 1) } } catch {}
+        if ($v -eq 0 -or $smb1On -eq $false) { [void]$dc['settings'].Add((New-Setting 'smb1' 'Disabled' 'ok' 'SMBv1 disabled' '')) }
+        elseif ($smb1On -eq $true -or $v -eq 1) { [void]$dc['settings'].Add((New-Setting 'smb1' 'Enabled' 'crit' 'SMBv1 enabled' 'Remove the SMB 1.0 feature from domain controllers after confirming no legacy clients depend on it.')) }
+        else { [void]$dc['settings'].Add((New-Setting 'smb1' 'Unknown' 'info' 'SMBv1 state could not be determined' 'Verify that the SMB 1.0 feature is removed.')) }
+        # SSL / TLS (server side)
+        $parts = [System.Collections.ArrayList]::new(); $tlsSev = 'ok'
+        foreach ($p in 'SSL 2.0','SSL 3.0','TLS 1.0','TLS 1.1','TLS 1.2') {
+            $en = Get-RegDword $s ($kSchan + '\' + $p + '\Server') 'Enabled'
+            $state = if ($null -eq $en) { 'default' } elseif ($en -eq 0) { 'off' } else { 'on' }
+            if ($p -like 'SSL*' -and $state -eq 'on') { $tlsSev = 'crit' }
+            if ($p -in @('TLS 1.0','TLS 1.1') -and $state -ne 'off' -and $tlsSev -ne 'crit') { $tlsSev = 'warn' }
+            if ($p -eq 'TLS 1.2' -and $state -eq 'off') { $tlsSev = 'crit' }
+            [void]$parts.Add("$p $state")
+        }
+        $tlsAdv = if ($tlsSev -eq 'crit') { 'Disable SSL 2.0/3.0 and make sure TLS 1.2 is enabled.' } elseif ($tlsSev -eq 'warn') { 'Explicitly disable TLS 1.0 and 1.1 on domain controllers once no clients depend on them.' } else { '' }
+        $tlsTitle = if ($tlsSev -eq 'crit') { 'Insecure SSL/TLS configuration' } elseif ($tlsSev -eq 'warn') { 'TLS 1.0/1.1 not disabled' } else { 'Legacy SSL/TLS disabled' }
+        [void]$dc['settings'].Add((New-Setting 'tls' ($parts -join ' | ') $tlsSev $tlsTitle $tlsAdv))
+        # LLMNR
+        $v = Get-RegDword $s $kDnsC 'EnableMulticast'
+        if ($v -eq 0) { [void]$dc['settings'].Add((New-Setting 'llmnr' 'Disabled' 'ok' 'LLMNR disabled' '')) }
+        else { [void]$dc['settings'].Add((New-Setting 'llmnr' 'Enabled' 'warn' 'LLMNR enabled' 'Turn off multicast name resolution by Group Policy to prevent name-poisoning attacks.')) }
+        # NetBIOS over TCP/IP
+        try {
+            $nics = @(Get-CimInstance -CimSession $s -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=true' -ErrorAction Stop)
+            $nbOn = 0; foreach ($nic in $nics) { if ([int]$nic.TcpipNetbiosOptions -ne 2) { $nbOn++ } }
+            if ($nbOn -eq 0) { [void]$dc['settings'].Add((New-Setting 'netbios' 'Disabled' 'ok' 'NetBIOS over TCP/IP disabled' '')) }
+            else { [void]$dc['settings'].Add((New-Setting 'netbios' "Enabled on $nbOn adapter(s)" 'info' 'NetBIOS over TCP/IP enabled' 'Disable NetBIOS over TCP/IP on domain controller adapters if no legacy applications need it.')) }
+        } catch {}
+        # WDigest
+        $v = Get-RegDword $s $kWd 'UseLogonCredential'
+        if ($v -eq 1) { [void]$dc['settings'].Add((New-Setting 'wdigest' 'Enabled' 'crit' 'WDigest stores clear-text passwords' 'Turn off WDigest authentication so clear-text credentials are not kept in memory.')) }
+        else { [void]$dc['settings'].Add((New-Setting 'wdigest' 'Disabled' 'ok' 'WDigest clear-text credentials off' '')) }
+        # LSA protection
+        $v = Get-RegDword $s $kLsa 'RunAsPPL'
+        if ($v -ge 1) { [void]$dc['settings'].Add((New-Setting 'lsaPpl' 'Enabled' 'ok' 'LSA protection enabled' '')) }
+        else { [void]$dc['settings'].Add((New-Setting 'lsaPpl' 'Off' 'warn' 'LSA protection off' 'Enable LSA protection (RunAsPPL) on domain controllers after testing third-party authentication components.')) }
+        # Kerberos encryption types
+        $v = Get-RegDword $s $kKerb 'SupportedEncryptionTypes'
+        if ($null -eq $v) { [void]$dc['settings'].Add((New-Setting 'kerbEnc' 'Not configured' 'info' 'Kerberos encryption types not configured' 'Configure allowed Kerberos encryption types to AES only once RC4 dependencies are removed.')) }
+        else {
+            $t = [System.Collections.ArrayList]::new()
+            if ($v -band 1) { [void]$t.Add('DES-CRC') }; if ($v -band 2) { [void]$t.Add('DES-MD5') }; if ($v -band 4) { [void]$t.Add('RC4') }
+            if ($v -band 8) { [void]$t.Add('AES128') }; if ($v -band 16) { [void]$t.Add('AES256') }
+            $txt = $t -join ', '
+            if ($v -band 3) { [void]$dc['settings'].Add((New-Setting 'kerbEnc' $txt 'crit' 'DES allowed for Kerberos' 'Remove DES from the allowed Kerberos encryption types.')) }
+            elseif ($v -band 4) { [void]$dc['settings'].Add((New-Setting 'kerbEnc' $txt 'warn' 'RC4 allowed for Kerberos' 'Plan to remove RC4 from the allowed Kerberos encryption types once no accounts depend on it.')) }
+            else { [void]$dc['settings'].Add((New-Setting 'kerbEnc' $txt 'ok' 'AES-only Kerberos' '')) }
+        }
+        # Print Spooler
+        try {
+            $sp = @(Get-CimInstance -CimSession $s -ClassName Win32_Service -Filter "Name='Spooler'" -ErrorAction Stop)
+            if ($sp.Count) {
+                $st = [string]$sp[0].State; $sm = [string]$sp[0].StartMode
+                if ($st -eq 'Running') { [void]$dc['settings'].Add((New-Setting 'spooler' "Running ($sm)" 'warn' 'Print Spooler running on DC' 'Stop and disable the Print Spooler service on domain controllers (coercion and PrintNightmare exposure).')) }
+                else { [void]$dc['settings'].Add((New-Setting 'spooler' "$st ($sm)" 'ok' 'Print Spooler not running' '')) }
+            }
+        } catch {}
+        # Platform: physical / VMware / Hyper-V / Azure (decides whether the Hyper-V time provider matters)
+        $plat = 'Unknown'; $model = ''
+        try {
+            $cs = @(Get-CimInstance -CimSession $s -ClassName Win32_ComputerSystem -ErrorAction Stop)
+            if ($cs.Count) {
+                $man = [string]$cs[0].Manufacturer; $model = [string]$cs[0].Model
+                if ($man -match 'VMware' -or $model -match 'VMware') { $plat = 'VMware' }
+                elseif ($man -match 'Microsoft' -and $model -match 'Virtual') { $plat = 'Hyper-V'; if (Test-RegKey $s 'SOFTWARE\Microsoft\Windows Azure') { $plat = 'Azure' } }
+                elseif ($model -match 'VirtualBox|KVM|QEMU|Xen|Nutanix|AHV|Bochs' -or $man -match 'QEMU|Xen|Nutanix|innotek|Red Hat|oVirt') { $plat = 'Other virtual' }
+                else { $plat = 'Physical' }
+            }
+        } catch {}
+        $dc['platform'] = $plat; $dc['model'] = $model
+        # Time configuration: Group Policy settings override the local registry
+        $pType = Get-RegString $s 'SOFTWARE\Policies\Microsoft\W32Time\Parameters' 'Type'
+        $pNtp  = Get-RegString $s 'SOFTWARE\Policies\Microsoft\W32Time\Parameters' 'NtpServer'
+        $lType = Get-RegString $s ($kW32 + '\Parameters') 'Type'
+        $lNtp  = Get-RegString $s ($kW32 + '\Parameters') 'NtpServer'
+        $tType = [string]$lType; $tNtp = [string]$lNtp; $tBy = 'Local'
+        if ($pType) { $tType = [string]$pType; $tBy = 'Group Policy' }
+        if ($pNtp)  { $tNtp = [string]$pNtp }
+        $dc['time'] = @{
+            type=$tType; ntpServer=$tNtp; cfgBy=$tBy
+            announce=(Get-RegDword $s ($kW32 + '\Config') 'AnnounceFlags')
+            vmic=(Get-RegDword $s ($kW32 + '\TimeProviders\VMICTimeProvider') 'Enabled')
+            source=''; offset=$null; offsetPdc=$null; error=''; lastSync=''; lastSyncDays=$null; stratum=''
+        }
+      }
+    } finally { Remove-CimSession $s -ErrorAction SilentlyContinue }
+  } catch { [void]$dc['notes'].Add("Collection error: $($_.Exception.Message)") }
+}
+
+# Domain-wide: accounts with DES-only Kerberos
+$DesOnly = [System.Collections.ArrayList]::new()
+try {
+    $des = @(Get-ADObject -LDAPFilter '(userAccountControl:1.2.840.113556.1.4.803:=2097152)' -Properties sAMAccountName -ResultSetSize 500)
+    foreach ($o in $des) { [void]$DesOnly.Add(@{ name=[string]$o.Name; sam=[string]$o.sAMAccountName; dn=[string]$o.DistinguishedName }) }
+} catch {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Security events
+# ─────────────────────────────────────────────────────────────────────────────
+$Since = (Get-Date).AddDays(-$EventDays)
+$EV = @{ collected=$false; days=$EventDays; ok=[System.Collections.ArrayList]::new(); failed=[System.Collections.ArrayList]::new();
+         lockouts=[System.Collections.ArrayList]::new(); failAccounts=[System.Collections.ArrayList]::new(); failSources=[System.Collections.ArrayList]::new(); failTotal=0;
+         kerbAccounts=[System.Collections.ArrayList]::new(); kerbTotal=0; privChanges=[System.Collections.ArrayList]::new(); cleared=[System.Collections.ArrayList]::new();
+         ldapDc=[System.Collections.ArrayList]::new(); ldapClients=[System.Collections.ArrayList]::new() }
+$PrivGroups = @('Domain Admins','Enterprise Admins','Schema Admins','Administrators','Account Operators','Backup Operators','Server Operators','Print Operators','DnsAdmins','Group Policy Creator Owners','Cert Publishers','Enterprise Key Admins','Key Admins')
+function Get-Events { param([string]$Dc,[string]$Log,[int[]]$Ids)
+    try { return @(Get-WinEvent -ComputerName $Dc -FilterHashtable @{ LogName=$Log; Id=$Ids; StartTime=$Since } -MaxEvents $MaxEventsPerDc -ErrorAction Stop) }
+    catch { if ($_.Exception.Message -match 'No events were found') { return @() } throw }
+}
+function PropVal { param($E,[int]$I) try { return [string]$E.Properties[$I].Value } catch { return '' } }
+# aggregation tables: key -> hashtable
+$aLock=@{}; $aFailAcc=@{}; $aFailSrc=@{}; $aKerb=@{}; $aLdapCli=@{}; $EVDaily=@{}
+function Bump-Day { param($When,[string]$T) try { $k=([datetime]$When).ToString('yyyy-MM-dd'); if (-not $EVDaily.ContainsKey($k)) { $EVDaily[$k]=@{ f=0; k=0; l=0 } }; $EVDaily[$k][$T] = [int]$EVDaily[$k][$T] + 1 } catch {} }
+function Agg { param([hashtable]$T,[string]$Key,[string]$Label,[string]$Dc,[datetime]$When,[string]$Other)
+    if (-not $T.ContainsKey($Key)) { $T[$Key] = @{ name=$Label; count=0; dcs=@{}; others=@{}; last=[datetime]::MinValue } }
+    $e = $T[$Key]; $e['count'] = [int]$e['count'] + 1; $e['dcs'][$Dc] = $true
+    if ($Other) { if ($e['others'].ContainsKey($Other)) { $e['others'][$Other] = [int]$e['others'][$Other] + 1 } else { $e['others'][$Other] = 1 } }
+    if ($When -gt $e['last']) { $e['last'] = $When }
+}
+function Flatten-Agg { param([hashtable]$T,[int]$Cap)
+    $items=[System.Collections.ArrayList]::new(); $keys=[System.Collections.ArrayList]::new()
+    foreach ($k in @($T.Keys)) {
+        $e = $T[$k]
+        $oi=[System.Collections.ArrayList]::new(); $ok=[System.Collections.ArrayList]::new()
+        foreach ($o in @($e['others'].Keys)) { [void]$oi.Add(@{ name=[string]$o; count=[int]$e['others'][$o] }); [void]$ok.Add((CountKey ([int]$e['others'][$o]) $o)) }
+        $oSorted=[System.Collections.ArrayList]::new(); Fill-Sorted -Items $oi -Keys $ok -Out $oSorted
+        $top=[System.Collections.ArrayList]::new(); foreach ($x in $oSorted) { if ($top.Count -ge 50) { break }; [void]$top.Add($x) }
+        $dcl=[System.Collections.ArrayList]::new(); foreach ($d in @($e['dcs'].Keys)) { [void]$dcl.Add(([string]$d -split '\.')[0].ToUpper()) }
+        [void]$items.Add(@{ name=[string]$e['name']; count=[int]$e['count']; distinct=[int]$e['others'].Count; others=$top; dcs=$dcl; last=(Fmt-Date $e['last']) })
+        [void]$keys.Add((CountKey ([int]$e['count']) ([string]$e['name'])))
+    }
+    $sorted=[System.Collections.ArrayList]::new(); Fill-Sorted -Items $items -Keys $keys -Out $sorted
+    $out=[System.Collections.ArrayList]::new(); foreach ($x in $sorted) { if ($out.Count -ge $Cap) { break }; [void]$out.Add($x) }
+    ,$out
+}
+
+$EV['skipped'] = [bool]$SkipEvents
+if (-not $SkipEvents) {
+    Write-Host "[3/6] Reading security events (last $EventDays days)..." -ForegroundColor Yellow
+    $EV['collected'] = $true
+    foreach ($dc in $DCS) {
+        $n = $dc['name']; $sn = $dc['short']
+        if (-not (Test-Port -ComputerName $n -Port 135 -TimeoutMs 1500)) { [void]$EV['failed'].Add(@{ dc=$sn; reason='RPC (135) not reachable' }); continue }
+        Write-Host "  $sn..." -ForegroundColor DarkGray
+        try {
+            foreach ($e in (Get-Events $n 'Security' @(4740))) { $acc=PropVal $e 0; $src=PropVal $e 1; Agg $aLock $acc.ToLower() $acc $n $e.TimeCreated $src; Bump-Day $e.TimeCreated 'l' }
+            foreach ($e in (Get-Events $n 'Security' @(4625))) {
+                $acc=PropVal $e 5; $ip=PropVal $e 19; $ws=PropVal $e 13
+                $src = if ($ip -and $ip -ne '-') { $ip } elseif ($ws -and $ws -ne '-') { $ws } else { 'unknown' }
+                Agg $aFailAcc $acc.ToLower() $acc $n $e.TimeCreated $src
+                Agg $aFailSrc $src.ToLower() $src $n $e.TimeCreated $acc.ToLower()
+                $EV['failTotal'] = [int]$EV['failTotal'] + 1; Bump-Day $e.TimeCreated 'f'
+            }
+            foreach ($e in (Get-Events $n 'Security' @(4771))) {
+                $acc=PropVal $e 0; $ip=(PropVal $e 6) -replace '^::ffff:',''
+                Agg $aKerb $acc.ToLower() $acc $n $e.TimeCreated $ip
+                $EV['kerbTotal'] = [int]$EV['kerbTotal'] + 1; Bump-Day $e.TimeCreated 'k'
+            }
+            foreach ($e in (Get-Events $n 'Security' @(4728,4732,4756,4729,4733,4757))) {
+                $grp = PropVal $e 2
+                if ($PrivGroups -contains $grp) {
+                    $act = if (@(4728,4732,4756) -contains [int]$e.Id) { 'added' } else { 'removed' }
+                    $mem = PropVal $e 0; if ($mem -match '^CN=([^,]+)') { $mem = $Matches[1] }
+                    [void]$EV['privChanges'].Add(@{ time=(Fmt-Date $e.TimeCreated); dc=$sn; group=$grp; member=$mem; action=$act; by=(PropVal $e 6); id=[int]$e.Id })
+                }
+            }
+            foreach ($e in (Get-Events $n 'Security' @(1102))) { [void]$EV['cleared'].Add(@{ time=(Fmt-Date $e.TimeCreated); dc=$sn; by=(PropVal $e 1) }) }
+            # LDAP binds (Directory Service log)
+            $s2887 = @(Get-Events $n 'Directory Service' @(2887))
+            if ($s2887.Count) { $last=$s2887[0]; [void]$EV['ldapDc'].Add(@{ dc=$sn; simple=[int](PropVal $last 0); unsignedSasl=[int](PropVal $last 1); when=(Fmt-Date $last.TimeCreated) }) }
+            foreach ($e in (Get-Events $n 'Directory Service' @(2889))) {
+                $ipPort = PropVal $e 0; $ip = ($ipPort -replace ':\d+$','') -replace '^\[|\]$',''
+                $who = PropVal $e 1; $bt = PropVal $e 2
+                $btTxt = if ($bt -eq '1') { 'Simple bind without SSL/TLS' } else { 'Unsigned SASL bind' }
+                Agg $aLdapCli ($ip.ToLower() + '|' + $who.ToLower()) ($ip + '  (' + $who + ')') $n $e.TimeCreated $btTxt
+            }
+            [void]$EV['ok'].Add($sn)
+        } catch { [void]$EV['failed'].Add(@{ dc=$sn; reason=[string]$_.Exception.Message }) }
+    }
+    $EV['lockouts'] = Flatten-Agg $aLock 200
+    $EV['failAccounts'] = Flatten-Agg $aFailAcc 200
+    $EV['failSources'] = Flatten-Agg $aFailSrc 200
+    $EV['kerbAccounts'] = Flatten-Agg $aKerb 200
+    $EV['ldapClients'] = Flatten-Agg $aLdapCli 500
+    $dl = [System.Collections.ArrayList]::new()
+    for ($i = $EventDays - 1; $i -ge 0; $i--) {
+        $dk = (Get-Date).AddDays(-$i).ToString('yyyy-MM-dd'); $dv = @{ f=0; k=0; l=0 }; if ($EVDaily.ContainsKey($dk)) { $dv = $EVDaily[$dk] }
+        [void]$dl.Add(@{ day=$dk; f=[int]$dv['f']; k=[int]$dv['k']; l=[int]$dv['l'] })
+    }
+    $EV['daily'] = $dl
+} else { Write-Host "[3/6] Security events skipped" -ForegroundColor DarkGray }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Time sync (source + offset via w32tm, run in parallel with a timeout)
+# ─────────────────────────────────────────────────────────────────────────────
+if (-not $SkipTime) {
+    Write-Host "[4/6] Checking time sources and offsets..." -ForegroundColor Yellow
+    $jobs=@{}
+    foreach ($dc in $DCS) {
+        if (-not (Test-Port -ComputerName $dc['name'] -Port 135 -TimeoutMs 1500)) { continue }
+        $jobs[$dc['name']] = Start-Job -ScriptBlock { param($c)
+            $src = (& w32tm /query /computer:$c /source 2>&1 | Out-String)
+            $sc  = (& w32tm /stripchart /computer:$c /samples:1 /dataonly 2>&1 | Out-String)
+            $st  = (& w32tm /query /computer:$c /status 2>&1 | Out-String)
+            $last = ''; $strat = ''
+            foreach ($line in ($st -split '\r?\n')) {
+                if ($line -match '^\s*Last Successful Sync Time:\s*(.+)$') { $raw = $Matches[1].Trim(); try { $last = ([datetime]::Parse($raw)).ToString('yyyy-MM-dd HH:mm') } catch { $last = $raw } }
+                if ($line -match '^\s*Stratum:\s*(\d+)') { $strat = $Matches[1] }
+            }
+            $src + '|||' + $sc + '|||' + $last + '|||' + $strat } -ArgumentList $dc['name']
+    }
+    $jl=[System.Collections.ArrayList]::new(); foreach ($j in $jobs.Values) { [void]$jl.Add($j) }
+    if ($jl.Count) { Wait-Job -Job $jl.ToArray() -Timeout 45 | Out-Null }
+    foreach ($dc in $DCS) {
+        if (-not $jobs.ContainsKey($dc['name'])) { continue }
+        if (-not $dc['time'].Count) { $dc['time'] = @{ type=''; ntpServer=''; cfgBy=''; announce=$null; vmic=$null; source=''; offset=$null; offsetPdc=$null; error=''; lastSync=''; lastSyncDays=$null; stratum='' } }
+        $j = $jobs[$dc['name']]
+        try {
+            if ($j.State -eq 'Completed') {
+                $out = [string](Receive-Job -Job $j)
+                $pp = $out -split '\|\|\|',4
+                $src = ([string]$pp[0]).Trim()
+                if ($src -match 'error|0x8') { $dc['time']['error'] = $src } else { $dc['time']['source'] = $src }
+                if ($pp.Count -gt 1 -and ([string]$pp[1]) -match '([+-]\d+\.\d+)s') { $dc['time']['offset'] = [double]$Matches[1] }
+                if ($pp.Count -gt 2) {
+                    $ls = ([string]$pp[2]).Trim(); $dc['time']['lastSync'] = $ls
+                    try { $lsd = [datetime]::ParseExact($ls,'yyyy-MM-dd HH:mm',[System.Globalization.CultureInfo]::InvariantCulture); $dc['time']['lastSyncDays'] = [int][math]::Floor(((Get-Date) - $lsd).TotalDays) } catch {}
+                }
+                if ($pp.Count -gt 3) { $dc['time']['stratum'] = ([string]$pp[3]).Trim() }
+            } else { Stop-Job -Job $j -ErrorAction SilentlyContinue; $dc['time']['error'] = 'w32tm did not answer in time' }
+        } catch { $dc['time']['error'] = [string]$_.Exception.Message }
+        Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
+    }
+    $pdcOff = $null; foreach ($dc in $DCS) { if ($dc['isPdc'] -and $dc['time'].Count -and $null -ne $dc['time']['offset']) { $pdcOff = [double]$dc['time']['offset'] } }
+    if ($null -ne $pdcOff) { foreach ($dc in $DCS) { if ($dc['time'].Count -and $null -ne $dc['time']['offset']) { $dc['time']['offsetPdc'] = [math]::Round(([double]$dc['time']['offset'] - $pdcOff),3) } } }
+} else { Write-Host "[4/6] Time checks skipped" -ForegroundColor DarkGray }
+
+# Evaluate time findings per DC
+foreach ($dc in $DCS) {
+    $t = $dc['time']; if (-not $t -or -not $t.Count) { continue }
+    $f = [System.Collections.ArrayList]::new()
+    $src = [string]$t['source']; $type = [string]$t['type']; $plat = [string]$dc['platform']
+    $local = [bool]($src -match 'Local CMOS Clock|Free-running')
+    $gpo = ''; if ($t['cfgBy'] -eq 'Group Policy') { $gpo = ' This setting comes from Group Policy, so change it in the GPO that applies to this DC.' }
+    if ($dc['isPdc']) {
+        if ($local -or ($type -and $type -ne 'NTP' -and $type -ne 'AllSync')) {
+            $why = 'It is running on its own clock.'
+            if ($type -eq 'NT5DS') { $why = 'It is set to follow the domain hierarchy (NT5DS), but as PDC emulator it is the top of that hierarchy, so it has no source and runs on its own clock.' }
+            elseif (-not $local -and $type) { $why = "Its time type is $type." }
+            [void]$f.Add(@{ sev='crit'; title='PDC has no external time source'; advice=($why + ' Configure the PDC emulator to sync from reliable external NTP servers (type NTP, marked as a reliable time source) and allow UDP 123 to them.' + $gpo) })
+        }
+    } else {
+        if ($local) { [void]$f.Add(@{ sev='crit'; title='DC not syncing from the domain hierarchy'; advice=('It is running on its own clock. Check that it can reach other domain controllers on UDP 123 and that its time type is NT5DS (domain hierarchy).' + $gpo) }) }
+        if ($type -eq 'NTP') { [void]$f.Add(@{ sev='warn'; title='Manual NTP source on a non-PDC DC'; advice=('Set this DC back to domain hierarchy sync (NT5DS) so only the PDC emulator uses external NTP.' + $gpo) }) }
+    }
+    # The Hyper-V time provider only matters on Hyper-V and Azure
+    if ($src -match 'VM IC Time') { [void]$f.Add(@{ sev='warn'; title='Syncing from the Hyper-V host'; advice='Disable the Hyper-V time synchronization provider on this domain controller so it follows the domain hierarchy.' }) }
+    elseif ($t['vmic'] -eq 1 -and ($plat -eq 'Hyper-V' -or $plat -eq 'Azure')) { [void]$f.Add(@{ sev='info'; title='Hyper-V time provider enabled'; advice="On $plat this provider can override the domain hierarchy. Disable it on domain controllers." }) }
+    if ($null -ne $t['offsetPdc'] -and -not $dc['isPdc']) {
+        $ab = [math]::Abs([double]$t['offsetPdc'])
+        if ($ab -ge 300) { [void]$f.Add(@{ sev='crit'; title='Clock more than 5 minutes off the PDC'; advice='Fix time sync on this DC; Kerberos fails beyond a 5-minute skew.' }) }
+        elseif ($ab -ge 2) { [void]$f.Add(@{ sev='warn'; title='Clock drifting from the PDC'; advice='Check the time source and the network path (UDP 123) to the PDC.' }) }
+    }
+    if ((-not $local) -and $null -ne $t['lastSyncDays'] -and [int]$t['lastSyncDays'] -ge 1) { [void]$f.Add(@{ sev='warn'; title='No recent successful time sync'; advice=('Last successful sync was ' + $t['lastSyncDays'] + ' day(s) ago. Check that the time source answers on UDP 123.') }) }
+    if ($t['error']) { [void]$f.Add(@{ sev='info'; title='Time source could not be queried'; advice='Check that the Windows Time service is reachable on this DC.' }) }
+    $t['findings'] = $f
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Backup & recovery readiness
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Host "[5/6] Backup and recovery readiness..." -ForegroundColor Yellow
+$BK = @{ recycleBin=$null; recycleBinEnabled=$false; tombstone=$null; partitions=[System.Collections.ArrayList]::new(); sysvol=@{ mode=''; state=''; sev='' } }
+try {
+    $rb = Get-ADOptionalFeature -Filter "Name -eq 'Recycle Bin Feature'" -ErrorAction Stop
+    if ($rb) { $BK['recycleBin'] = $true; $sc = 0; foreach ($x in $rb.EnabledScopes) { if ($x) { $sc++ } }; $BK['recycleBinEnabled'] = [bool]($sc -gt 0) }
+    else { $BK['recycleBin'] = $false }
+} catch { $BK['recycleBin'] = $false }
+try {
+    $root = Get-ADRootDSE -ErrorAction Stop
+    $cfg = [string]$root.configurationNamingContext
+    $ds = Get-ADObject ("CN=Directory Service,CN=Windows NT,CN=Services," + $cfg) -Properties tombstoneLifetime -ErrorAction Stop
+    $tsl = 60; if ($ds.tombstoneLifetime) { $tsl = [int]$ds.tombstoneLifetime }
+    $BK['tombstone'] = $tsl
+    foreach ($nc in @($root.namingContexts)) {
+        $ncs = [string]$nc; $last = $null; $err = ''
+        try {
+            $md = Get-ADReplicationAttributeMetadata -Object $ncs -Server $PdcName -Properties dSASignature -ErrorAction Stop
+            foreach ($m in @($md)) { if ([string]$m.AttributeName -eq 'dSASignature') { $last = $m.LastOriginatingChangeTime } }
+        } catch { $err = [string]$_.Exception.Message }
+        $days = $null; if ($last) { $days = [int][math]::Floor(((Get-Date) - [datetime]$last).TotalDays) }
+        $label = if ($ncs -eq $DomainDN) { 'Domain' } elseif ($ncs -like 'CN=Configuration,*') { 'Configuration' } elseif ($ncs -like 'CN=Schema,*') { 'Schema' } elseif ($ncs -like 'DC=DomainDnsZones,*') { 'DomainDnsZones' } elseif ($ncs -like 'DC=ForestDnsZones,*') { 'ForestDnsZones' } else { $ncs }
+        [void]$BK['partitions'].Add(@{ name=$label; dn=$ncs; last=(Fmt-Date $last); days=$days; error=$err })
+    }
+} catch {}
+$flRaw = $null; $dfsrGroup = $false
+try { $gs = Get-ADObject ("CN=DFSR-GlobalSettings,CN=System," + $DomainDN) -Properties 'msDFSR-Flags' -ErrorAction Stop; $flRaw = $gs.'msDFSR-Flags' } catch {}
+try { $null = Get-ADObject ("CN=Domain System Volume,CN=DFSR-GlobalSettings,CN=System," + $DomainDN) -ErrorAction Stop; $dfsrGroup = $true } catch {}
+if ($null -ne $flRaw -and [int]$flRaw -eq 48) { $BK['sysvol'] = @{ mode='DFSR'; state='Migrated from FRS (Eliminated state)'; sev='ok' } }
+elseif ($dfsrGroup -and $null -eq $flRaw) { $BK['sysvol'] = @{ mode='DFSR'; state='DFSR from the start'; sev='ok' } }
+elseif ($null -ne $flRaw -and ([int]$flRaw -eq 16 -or [int]$flRaw -eq 32)) { $BK['sysvol'] = @{ mode='FRS to DFSR migration'; state=$(if ([int]$flRaw -eq 16) { 'Prepared state - migration not finished' } else { 'Redirected state - migration not finished' }); sev='warn' } }
+else { $BK['sysvol'] = @{ mode='FRS'; state='SYSVOL is still replicated by FRS'; sev='crit' } }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Windows Server 2025 migration readiness
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Host "[6/6] Windows Server 2025 readiness..." -ForegroundColor Yellow
+$W25 = @{ ffl=$null; dfl=$null; schema=$null; aesDate=''; dcs=[System.Collections.ArrayList]::new(); krbtgt=@{};
+          svcNoAes=[System.Collections.ArrayList]::new(); rc4Only=[System.Collections.ArrayList]::new();
+          usersNoAesCount=0; usersNoAes=[System.Collections.ArrayList]::new();
+          legacyComputers=[System.Collections.ArrayList]::new(); nonWindows=[System.Collections.ArrayList]::new();
+          exchange=[System.Collections.ArrayList]::new(); notes=[System.Collections.ArrayList]::new() }
+function Get-EncTxt { param($V)
+    if ($null -eq $V) { return 'not set' }
+    $t=[System.Collections.ArrayList]::new(); $v=[int64]$V
+    if ($v -band 1) { [void]$t.Add('DES-CRC') }; if ($v -band 2) { [void]$t.Add('DES-MD5') }; if ($v -band 4) { [void]$t.Add('RC4') }
+    if ($v -band 8) { [void]$t.Add('AES128') }; if ($v -band 16) { [void]$t.Add('AES256') }
+    if ($t.Count -eq 0) { return "0x{0:x}" -f $v }; return ($t -join ', ') }
+try {
+    $root6 = Get-ADRootDSE -ErrorAction Stop
+    $cfg6  = [string]$root6.configurationNamingContext
+    try { $p = Get-ADObject ("CN=Partitions," + $cfg6) -Properties 'msDS-Behavior-Version' -ErrorAction Stop; $W25['ffl'] = [int]$p.'msDS-Behavior-Version' } catch { [void]$W25['notes'].Add('Forest functional level could not be read.') }
+    try { $dh = Get-ADObject $DomainDN -Properties 'msDS-Behavior-Version' -ErrorAction Stop; $W25['dfl'] = [int]$dh.'msDS-Behavior-Version' } catch { [void]$W25['notes'].Add('Domain functional level could not be read.') }
+    try { $sc = Get-ADObject ([string]$root6.schemaNamingContext) -Properties objectVersion -ErrorAction Stop; $W25['schema'] = [int]$sc.objectVersion } catch {}
+    # Every DC in the forest (functional level 2016 needs all of them on 2016+)
+    $doms = @($DomainDNS); if ($Forest) { $doms = @($Forest.Domains) }
+    foreach ($dom in $doms) {
+        try {
+            foreach ($x in @(Get-ADDomainController -Filter * -Server ([string]$dom) -ErrorAction Stop)) {
+                $b = 0; try { $b = [int](([string]$x.OperatingSystemVersion) -replace '^.*\((\d+)\).*$','$1') } catch {}
+                [void]$W25['dcs'].Add(@{ name=[string]$x.HostName; domain=[string]$dom; os=[string]$x.OperatingSystem; build=$b; ok=[bool]($b -ge 14393) })
+            }
+        } catch { [void]$W25['notes'].Add("Domain controllers of $dom could not be listed: $($_.Exception.Message)") }
+    }
+    # Date AES keys became available: creation of the "Read-only Domain Controllers" group (RID 521, added with the first 2008 schema)
+    $aesDate = $null
+    try { $rodcG = Get-ADGroup -Identity ([string]$Domain.DomainSID.Value + '-521') -Properties whenCreated -ErrorAction Stop; $aesDate = [datetime]$rodcG.whenCreated; $W25['aesDate'] = $aesDate.ToString('yyyy-MM-dd') }
+    catch { [void]$W25['notes'].Add('Could not determine when AES keys became available (Read-only Domain Controllers group not found); password-age checks skipped.') }
+    # krbtgt
+    try {
+        $k = Get-ADUser krbtgt -Properties PasswordLastSet,'msDS-SupportedEncryptionTypes' -ErrorAction Stop
+        $noAes = $false; if ($aesDate -and $k.PasswordLastSet -and ([datetime]$k.PasswordLastSet -lt $aesDate)) { $noAes = $true }
+        $W25['krbtgt'] = @{ last=(Fmt-Date $k.PasswordLastSet); noAes=$noAes; enc=(Get-EncTxt $k.'msDS-SupportedEncryptionTypes') }
+    } catch {}
+    # Users: service accounts (SPN) without AES keys, RC4-only encryption types, all users with pre-AES passwords
+    try {
+        $users = @(Get-ADUser -Filter 'Enabled -eq $true' -Properties PasswordLastSet,servicePrincipalName,'msDS-SupportedEncryptionTypes' -ErrorAction Stop)
+        foreach ($u in $users) {
+            $last = $u.PasswordLastSet; $hasSpn = [bool](@($u.servicePrincipalName).Count -gt 0 -and $u.servicePrincipalName)
+            $old = [bool]($aesDate -and $last -and ([datetime]$last -lt $aesDate))
+            $et = $u.'msDS-SupportedEncryptionTypes'
+            if ([string]$u.SamAccountName -eq 'krbtgt') { continue }
+            if ($old) {
+                $W25['usersNoAesCount'] = [int]$W25['usersNoAesCount'] + 1
+                if ($hasSpn) { [void]$W25['svcNoAes'].Add(@{ name=[string]$u.Name; sam=[string]$u.SamAccountName; last=(Fmt-Date $last) }) }
+                elseif ($W25['usersNoAes'].Count -lt 200) { [void]$W25['usersNoAes'].Add(@{ name=[string]$u.Name; sam=[string]$u.SamAccountName; last=(Fmt-Date $last) }) }
+            }
+            if ($null -ne $et) { $ev=[int64]$et; if (($ev -band 4) -and -not ($ev -band 24)) { [void]$W25['rc4Only'].Add(@{ name=[string]$u.Name; sam=[string]$u.SamAccountName; kind='user'; enc=(Get-EncTxt $ev) }) } }
+        }
+    } catch { [void]$W25['notes'].Add("User accounts could not be read: $($_.Exception.Message)") }
+    # Computers: legacy OS without AES, non-Windows systems, RC4-only encryption types
+    try {
+        $comps = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem,'msDS-SupportedEncryptionTypes' -ErrorAction Stop)
+        foreach ($c in $comps) {
+            $os = [string]$c.OperatingSystem
+            if ($os -match 'Windows (XP|2000|NT)|Windows Server 2003|Windows Server® 2003') { [void]$W25['legacyComputers'].Add(@{ name=[string]$c.Name; os=$os }) }
+            elseif ($os -and $os -notmatch 'Windows') { if ($W25['nonWindows'].Count -lt 300) { [void]$W25['nonWindows'].Add(@{ name=[string]$c.Name; os=$os }) } }
+            $et = $c.'msDS-SupportedEncryptionTypes'
+            if ($null -ne $et) { $ev=[int64]$et; if (($ev -band 4) -and -not ($ev -band 24)) { [void]$W25['rc4Only'].Add(@{ name=[string]$c.Name; sam=[string]$c.SamAccountName; kind='computer'; enc=(Get-EncTxt $ev) }) } }
+        }
+    } catch { [void]$W25['notes'].Add("Computer accounts could not be read: $($_.Exception.Message)") }
+    # Exchange servers in the forest
+    try {
+        $ex = @(Get-ADObject -SearchBase ("CN=Microsoft Exchange,CN=Services," + $cfg6) -LDAPFilter '(objectClass=msExchExchangeServer)' -Properties serialNumber -ErrorAction Stop)
+        foreach ($e in $ex) {
+            $sn = [string](@($e.serialNumber)[0]); $ver=''
+            if ($sn -match 'Version (\d+\.\d+)') { $ver = $Matches[1] }
+            $label = switch ($ver) { '15.2' { 'Exchange 2019 / SE' } '15.1' { 'Exchange 2016' } '15.0' { 'Exchange 2013' } '14.3' { 'Exchange 2010' } '14.2' { 'Exchange 2010' } '14.1' { 'Exchange 2010' } '14.0' { 'Exchange 2010' } default { if ($ver) { "Exchange $ver" } else { 'Exchange (version unknown)' } } }
+            [void]$W25['exchange'].Add(@{ name=[string]$e.Name; version=$sn; ver=$ver; label=$label })
+        }
+    } catch {}
+} catch { [void]$W25['notes'].Add("Readiness checks failed: $($_.Exception.Message)") }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON: .NET JavaScriptSerializer (fast). PowerShell serializer = fallback.
+# ─────────────────────────────────────────────────────────────────────────────
+function ConvertTo-JsonStr {
+    param([string]$s)
+    if ([string]::IsNullOrEmpty($s)) { return '""' }
+    if ($s -notmatch '[^\x20\x21\x23-\x5B\x5D-\x7E]') { return '"' + $s + '"' }
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.Append('"')
+    foreach ($ch in $s.ToCharArray()) {
+        $code = [int][char]$ch
+        if     ($code -eq 34) { [void]$sb.Append('\"') }
+        elseif ($code -eq 92) { [void]$sb.Append('\\') }
+        elseif ($code -lt 32 -or $code -gt 126) { [void]$sb.Append(('\u{0:x4}' -f $code)) }
+        else { [void]$sb.Append($ch) }
+    }
+    [void]$sb.Append('"'); $sb.ToString()
+}
+function Write-JsonValue {
+    param($o, [System.Text.StringBuilder]$sb)
+    if ($null -eq $o) { [void]$sb.Append('null'); return }
+    if ($o -is [bool])   { [void]$sb.Append($(if ($o) { 'true' } else { 'false' })); return }
+    if ($o -is [string]) { [void]$sb.Append((ConvertTo-JsonStr $o)); return }
+    if ($o -is [int] -or $o -is [long] -or $o -is [double]) { [void]$sb.Append(([string]$o).Replace(',','.')); return }
+    if ($o -is [System.Collections.IDictionary]) {
+        [void]$sb.Append('{'); $f=$true
+        foreach ($k in $o.Keys) { if (-not $f) { [void]$sb.Append(',') }; $f=$false; [void]$sb.Append((ConvertTo-JsonStr ([string]$k))); [void]$sb.Append(':'); Write-JsonValue $o[$k] $sb }
+        [void]$sb.Append('}'); return
+    }
+    if ($o -is [System.Collections.IEnumerable]) {
+        [void]$sb.Append('['); $f=$true
+        foreach ($item in $o) { if (-not $f) { [void]$sb.Append(',') }; $f=$false; Write-JsonValue $item $sb }
+        [void]$sb.Append(']'); return
+    }
+    [void]$sb.Append((ConvertTo-JsonStr ([string]$o)))
+}
+
+Write-Host "Assembling report data..." -ForegroundColor Yellow
+$stage = 'summary'
+try {
+    $Summary = @{ domain=$DomainDNS; forest=$ForestDNS; generated=$GeneratedAt; pdc=$PdcName; dcs=$DCS; desOnly=$DesOnly; events=$EV; backup=$BK; w25=$W25 }
+    $stage = 'serialize'
+    $DataJSON = $null
+    try {
+        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+        $ser = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
+        $ser.MaxJsonLength = [int]::MaxValue; $ser.RecursionLimit = 256
+        $DataJSON = $ser.Serialize($Summary)
+        if ($DataJSON.Contains('"ImmediateBaseObject"')) { throw 'PowerShell wrapper detected in output' }
+    } catch {
+        Write-Host ("  .NET serializer unavailable ({0}) - using PowerShell fallback..." -f $_.Exception.Message) -ForegroundColor DarkYellow
+        $__jsb = [System.Text.StringBuilder]::new(); Write-JsonValue $Summary $__jsb; $DataJSON = $__jsb.ToString()
+    }
+    Write-Host ("  JSON size: {0} MB" -f [math]::Round($DataJSON.Length/1MB,2)) -ForegroundColor Gray
+} catch {
+    Write-Host ""
+    Write-Host ">>> FAILED at stage '$stage': $($_.Exception.GetType().Name) - $($_.Exception.Message)" -ForegroundColor Red
+    throw
+}
+
+Write-Host "Composing HTML..." -ForegroundColor Yellow
+$HTML = @"
+<!DOCTYPE html>
+<html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AD DC Posture - $DomainDNS</title>
+<style>
+:root{
+  --bg:#f5f6fb; --surface:#ffffff; --surface2:#eef1f9; --surface3:#dfe4f2; --border:#e4e7f2; --text:#161a2e; --muted:#64708c;
+  --accent:#4f46e5; --accent-hover:#6366f1; --accent-soft:#e6e6fd;
+  --blue:#2563eb; --blue-soft:#dbe8fe; --green:#059669; --green-soft:#d1fae5; --red:#dc2626; --red-soft:#fde2e2;
+  --amber:#d97706; --amber-soft:#fef3c7; --teal:#0d9488; --teal-soft:#cdeee9; --purple:#7c3aed; --purple-soft:#ede9fe;
+  --radius:13px; --radius-sm:9px;
+  --shadow:0 2px 8px rgb(60 50 140 / 0.06), 0 1px 2px rgb(60 50 140 / 0.04);
+  --shadow-hover:0 10px 15px -3px rgb(0 0 0 / 0.08), 0 4px 6px -4px rgb(0 0 0 / 0.08);
+  --font:'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --mono:'SFMono-Regular', ui-monospace, Menlo, Consolas, monospace;
+}
+[data-theme="dark"]{
+  --bg:#0c1524; --surface:#14213a; --surface2:#1c2c49; --surface3:#284066; --border:#243a5e; --text:#e8f0fb; --muted:#93a7c4;
+  --accent:#60a5fa; --accent-hover:#93c5fd; --accent-soft:rgba(96,165,250,0.15);
+  --blue:#60a5fa; --blue-soft:rgba(59,130,246,0.15); --green:#34d399; --green-soft:rgba(16,185,129,0.15); --red:#f87171; --red-soft:rgba(239,68,68,0.15);
+  --amber:#fbbf24; --amber-soft:rgba(245,158,11,0.15); --teal:#2dd4bf; --teal-soft:rgba(20,184,166,0.15); --purple:#a78bfa; --purple-soft:rgba(139,92,246,0.15);
+  --shadow:0 4px 6px -1px rgb(0 0 0 / 0.2), 0 2px 4px -2px rgb(0 0 0 / 0.2); --shadow-hover:0 10px 15px -3px rgb(0 0 0 / 0.3), 0 4px 6px -4px rgb(0 0 0 / 0.3);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;-webkit-font-smoothing:antialiased}
+i.ic{display:inline-flex;width:1em;height:1em;flex-shrink:0}i.ic svg{width:100%;height:100%}
+.mono{font-family:var(--mono);font-size:12px}
+.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 28px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100;box-shadow:var(--shadow)}
+.brand{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:700;color:var(--text)}
+.brand i{font-size:22px;color:var(--accent)}
+.topmeta{margin-left:auto;font-size:12px;color:var(--muted);text-align:right;line-height:1.4}.topmeta b{color:var(--text);font-weight:600}
+.btn{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;cursor:pointer;display:flex;align-items:center;gap:8px;transition:all .2s ease;font-family:var(--font)}
+.btn:hover{background:var(--surface2);border-color:var(--surface3)}.btn i{font-size:14px;color:var(--muted)}
+.mini-btn{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-size:12px;padding:5px 10px;border-radius:var(--radius-sm);cursor:pointer;font-weight:500;display:inline-flex;align-items:center;gap:5px;font-family:var(--font);margin-left:auto}
+.mini-btn:hover{background:var(--surface3)}.mini-btn i{font-size:12px;color:var(--muted)}
+.sep{width:1px;height:24px;background:var(--border)}
+.wrap{max-width:1080px;margin:0 auto;padding:28px 64px 70px}
+@media(max-width:760px){.wrap{padding:20px 18px}}
+.section-label{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:44px 0 14px;display:flex;align-items:center;gap:8px}
+.section-label:first-child{margin-top:4px}.section-label i{color:var(--accent);font-size:15px}
+.section-label .cnt{font-size:11px;font-weight:700;background:var(--surface3);color:var(--muted);border-radius:999px;padding:1px 8px;letter-spacing:0}
+.banner-note{font-size:12px;color:var(--muted);background:var(--surface2);border:1px dashed var(--border);border-radius:var(--radius-sm);padding:8px 12px;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.banner-note i{color:var(--amber)}
+/* KPI */
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:44px}
+.kpi{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 14px;display:flex;align-items:center;gap:12px;box-shadow:var(--shadow);transition:box-shadow .2s ease,border-color .2s ease;position:relative}
+.kpi.clickable{cursor:pointer}.kpi.clickable:hover{box-shadow:var(--shadow-hover);border-color:var(--accent-soft)}
+.kpi.active{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft),var(--shadow)}
+.kpi .chip{width:44px;height:44px;border-radius:var(--radius-sm);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:22px;background:var(--accent-soft);color:var(--accent)}
+.kpi .body{min-width:0}
+.kpi .val{font-size:26px;font-weight:800;color:var(--text);line-height:1.1;letter-spacing:-.02em}
+.kpi .lbl{font-size:11.5px;color:var(--muted);font-weight:500;margin-top:4px;line-height:1.3}
+.kpi .hint{font-size:11px;color:var(--accent);margin-top:4px;display:flex;align-items:center;gap:4px;font-weight:500;visibility:hidden;height:14px}
+.kpi.clickable:hover .hint{visibility:visible}
+.kpi.k-amber .chip{background:var(--amber-soft);color:var(--amber)}.kpi.k-amber.active{border-color:var(--amber);box-shadow:0 0 0 3px var(--amber-soft)}
+.kpi.k-red .chip{background:var(--red-soft);color:var(--red)}.kpi.k-red.active{border-color:var(--red);box-shadow:0 0 0 3px var(--red-soft)}
+.kpi.k-green .chip{background:var(--green-soft);color:var(--green)}.kpi.k-blue .chip{background:var(--blue-soft);color:var(--blue)}.kpi.k-teal .chip{background:var(--teal-soft);color:var(--teal)}
+.filter-banner{background:var(--surface);border:1px solid var(--accent);border-radius:var(--radius);padding:16px 20px;margin-bottom:20px;box-shadow:0 0 0 3px var(--accent-soft),var(--shadow)}
+.filter-banner-head{display:flex;align-items:center;gap:10px;font-size:14px;font-weight:600;margin-bottom:12px;color:var(--text)}
+.filter-banner-head i{color:var(--accent);font-size:16px}
+.fb-list{display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto}
+.fb-row{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;transition:all .15s}
+.fb-row:hover{background:var(--surface);border-color:var(--accent)}
+.fb-row .nm{flex:1;min-width:0;font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fb-row .cx{font-size:11px;font-weight:600;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:3px 10px}
+/* panels */
+.layout{display:grid;grid-template-columns:340px 1fr;gap:24px}
+.layout>.panel-card{height:540px;min-height:0}
+.layout .item-list{max-height:none;min-height:0}
+.layout .detail{min-height:0;height:100%}
+.layout .item{padding:9px 12px}.layout .item-ico{width:32px;height:32px;font-size:15px}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.layout>.panel-card{height:auto}.layout .item-list{max-height:360px}}
+.panel-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow);display:flex;flex-direction:column;margin-bottom:20px}
+.panel-head{padding:16px 20px;border-bottom:1px solid var(--border);font-size:14px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:10px}
+.panel-head i{color:var(--muted);font-size:16px}
+.panel-head .sub{font-size:12px;color:var(--muted);font-weight:500}
+.panel-body{padding:16px 20px}
+.list-search{padding:12px 20px;border-bottom:1px solid var(--border)}
+.list-search input{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 14px;color:var(--text);font-size:13px;outline:none;font-family:var(--font)}
+.list-search input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);background:var(--surface)}
+.item-list{padding:10px;max-height:620px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;flex:1}
+.item{display:flex;align-items:center;gap:12px;padding:12px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;transition:all .15s;background:var(--surface)}
+.item:hover{background:var(--surface2);border-color:var(--accent-soft)}.item.sel{background:var(--accent-soft);border-color:var(--accent)}.item.hide{display:none}
+.item-ico{width:38px;height:38px;border-radius:var(--radius-sm);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:17px;background:var(--accent-soft);color:var(--accent)}
+.item-ico.sev-high{background:var(--red-soft);color:var(--red)}.item-ico.sev-medium{background:var(--amber-soft);color:var(--amber)}.item-ico.sev-low{background:var(--blue-soft);color:var(--blue)}.item-ico.sev-ok{background:var(--green-soft);color:var(--green)}
+.item-body{flex:1;min-width:0}
+.item-name{font-size:13.5px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item-sub{font-size:11px;color:var(--muted);margin-top:2px}
+.detail{flex:1;display:flex;flex-direction:column;min-height:420px}
+.detail-head{padding:20px;border-bottom:1px solid var(--border)}
+.detail-title{font-size:18px;font-weight:700;display:flex;align-items:center;gap:10px;word-break:break-word}
+.detail-sub{font-size:12px;color:var(--muted);margin-top:6px}
+.detail-body{padding:24px 20px;overflow-y:auto;flex:1}
+.dsec{margin-bottom:26px}.dsec:last-child{margin-bottom:0}
+.dsec-t{font-size:12px;font-weight:700;color:var(--text);text-transform:uppercase;letter-spacing:.05em;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.dsec-t::after{content:'';flex:1;height:1px;background:var(--border);margin-left:8px}
+.dsec p{font-size:13px;line-height:1.55;color:var(--text)}
+.kv-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+@media(max-width:600px){.kv-grid{grid-template-columns:1fr}}
+.kv{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:11px 13px}
+.kv .k{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.kv .v{font-size:14px;font-weight:600;color:var(--text);margin-top:3px;word-break:break-word}
+.kv .v.good{color:var(--green)}.kv .v.bad{color:var(--red)}.kv .v.warn{color:var(--amber)}.kv .v.mut{color:var(--muted)}
+.findings{display:flex;flex-direction:column;gap:8px}
+.finding{display:flex;align-items:flex-start;gap:10px;padding:11px 13px;border-radius:var(--radius-sm);font-size:12.5px;line-height:1.5;border:1px solid var(--border)}
+.finding i{font-size:15px;flex-shrink:0;margin-top:1px}
+.finding.high{background:var(--red-soft);border-color:rgba(239,68,68,.25)}.finding.high i{color:var(--red)}
+.finding.medium{background:var(--amber-soft);border-color:rgba(245,158,11,.25)}.finding.medium i{color:var(--amber)}
+.finding.low{background:var(--blue-soft);border-color:rgba(59,130,246,.25)}.finding.low i{color:var(--blue)}
+.finding b{display:block;font-size:13px;margin-bottom:2px}
+.finding .aff{color:var(--muted);font-size:12px;margin-top:3px}
+.no-findings{color:var(--green);font-size:13px;display:flex;align-items:center;gap:8px;padding:12px;background:var(--green-soft);border-radius:var(--radius-sm)}
+.muted-note{color:var(--muted);font-size:13px;padding:16px;background:var(--surface2);border-radius:var(--radius-sm);border:1px dashed var(--border);text-align:center}
+/* tables */
+.tbl-wrap{overflow:auto;max-height:520px}
+table.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{position:sticky;top:0;background:var(--surface2);text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--border);white-space:nowrap}
+.tbl td{padding:10px 14px;border-bottom:1px solid var(--border);vertical-align:top}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr:hover td{background:var(--surface2)}
+.tbl td.num{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+.tag{font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;white-space:nowrap;display:inline-block}
+.tag.ok{background:var(--green-soft);color:var(--green)}.tag.warn{background:var(--amber-soft);color:var(--amber)}.tag.high{background:var(--red-soft);color:var(--red)}.tag.low{background:var(--blue-soft);color:var(--blue)}.tag.mut{background:var(--surface3);color:var(--muted)}
+.dot{width:9px;height:9px;border-radius:999px;display:inline-block;flex-shrink:0}
+.dot.high{background:var(--red)}.dot.medium{background:var(--amber)}.dot.low{background:var(--blue)}.dot.ok{background:var(--green)}.dot.mut{background:var(--surface3)}
+.stat-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:20px}
+.stat-pill{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;text-align:center;box-shadow:var(--shadow)}
+.stat-pill .v{font-size:22px;font-weight:800}.stat-pill .l{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:3px;font-weight:600}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:20px}@media(max-width:900px){.two{grid-template-columns:1fr}}
+.two .panel-card{margin-bottom:0}
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--surface3);border-radius:999px;border:2px solid var(--surface)}
+.flist{display:flex;flex-direction:column}
+.frow{border-bottom:1px solid var(--border)}.frow:last-child{border-bottom:none}
+.fh{display:flex;align-items:center;gap:12px;padding:11px 18px;cursor:pointer}
+.fh:hover{background:var(--surface2)}
+.fh .t{flex:1;min-width:0;font-size:13.5px;font-weight:600}
+.fh .m{font-size:12px;color:var(--muted);white-space:nowrap}
+.fh .s{font-size:11px;color:var(--muted);border:1px solid var(--border);border-radius:999px;padding:1px 9px;white-space:nowrap}
+.fh .cv{width:12px;height:12px;color:var(--muted);transition:transform .15s}.frow.open .fh .cv{transform:rotate(90deg)}
+.fb{display:none;padding:0 18px 14px 39px;font-size:13px;line-height:1.55}
+.frow.open .fb{display:block}
+.fb .who{color:var(--muted);font-size:12px;margin-top:6px}
+.fb a{color:var(--accent);cursor:pointer;font-weight:600;font-size:12px}
+.fmore{display:flex;align-items:center;justify-content:center;gap:6px;padding:10px;border-top:1px solid var(--border);font-size:12.5px;font-weight:600;color:var(--accent);cursor:pointer;background:var(--surface)}
+.fmore:hover{background:var(--surface2)}
+.fgroup{border-top:1px solid var(--border);background:var(--surface2)}
+.fgroup .fh .t{font-weight:700;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+.fgroup .flist{background:var(--surface)}
+.rowhide{display:none}
+.tmore{display:block;width:100%;text-align:center;padding:9px;font-size:12.5px;font-weight:600;color:var(--accent);cursor:pointer;background:var(--surface);border:none;border-top:1px solid var(--border);font-family:var(--font)}
+.tmore:hover{background:var(--surface2)}
+.okline{display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;font-size:12.5px;color:var(--muted);padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:20px}
+.okline b{color:var(--green);display:inline-flex;align-items:center;gap:6px}
+.side{position:fixed;left:0;top:0;bottom:0;width:252px;background:linear-gradient(180deg,#1c2044 0%,#141731 100%);color:#c9cde6;display:flex;flex-direction:column;padding:22px 14px 18px;z-index:100;overflow-y:auto}
+[data-theme="dark"] .side{background:linear-gradient(180deg,#0a1222 0%,#070d19 100%);border-right:1px solid var(--border)}
+.sbrand{display:flex;align-items:center;gap:12px;padding:0 8px 18px;border-bottom:1px solid rgba(255,255,255,.08)}
+.slogo{width:40px;height:40px;border-radius:11px;background:linear-gradient(135deg,#6366f1,#4338ca);display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;flex-shrink:0;box-shadow:0 4px 12px rgba(79,70,229,.4)}
+.skick{font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:#8a90b8;font-weight:700}
+.stitle{font-size:14.5px;font-weight:700;color:#fff;line-height:1.25;margin-top:2px}
+.smeta{font-size:11.5px;color:#8f95ba;line-height:1.45;padding:14px 8px;border-bottom:1px solid rgba(255,255,255,.08)}
+.smeta div{margin-bottom:8px}.smeta div:last-child{margin-bottom:0}.smeta b{display:block;color:#e6e8f5;font-weight:600;word-break:break-all;font-size:12px}
+.sgroup{font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:#6f76a3;font-weight:700;padding:18px 10px 8px}
+#secnav a{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:9px;font-size:13px;color:#c9cde6;cursor:pointer;font-weight:500;margin-bottom:2px;text-decoration:none;transition:background .15s}
+#secnav a:hover{background:rgba(255,255,255,.06);color:#fff}
+#secnav a.on{background:rgba(99,102,241,.25);color:#fff;font-weight:600}
+#secnav a i{font-size:15px;color:#8a90b8}#secnav a.on i{color:#a5b4fc}
+#secnav a .n{margin-left:auto;font-size:10.5px;font-weight:700;padding:1px 7px;border-radius:999px;background:rgba(255,255,255,.1);color:#c9cde6}
+#secnav a .n.high{background:rgba(239,68,68,.28);color:#fecaca}#secnav a .n.medium{background:rgba(245,158,11,.25);color:#fde68a}
+.sfoot{margin-top:auto;padding-top:14px;border-top:1px solid rgba(255,255,255,.08)}
+.sbtn{width:100%;display:flex;align-items:center;gap:9px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#e6e8f5;padding:9px 12px;border-radius:9px;font-size:12.5px;font-weight:500;cursor:pointer;font-family:var(--font)}
+.sbtn:hover{background:rgba(255,255,255,.1)}
+.main{margin-left:252px;padding:30px 44px 70px;max-width:1300px}
+.phead{margin-bottom:28px}.phead h1{font-size:22px;font-weight:800;letter-spacing:-.02em}.psub{font-size:13px;color:var(--muted);margin-top:4px}
+.anchor{scroll-margin-top:20px}
+.sect{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:56px;overflow:hidden}
+.sect-head{display:flex;align-items:center;gap:10px;padding:14px 20px;border-bottom:1px solid var(--border);background:var(--surface2);font-size:14.5px;font-weight:700}
+.sect-head>i{color:var(--accent);font-size:16px}
+.sect-head .cnt{font-size:11px;font-weight:700;background:var(--surface3);color:var(--muted);border-radius:999px;padding:1px 8px}
+.sect-body{padding:20px}.sect-body.flush{padding:0}
+.sect .panel-card{box-shadow:none}
+.sect-body>.panel-card:last-child,.sect-body>.okline:last-child,.sect-body>.no-findings:last-child{margin-bottom:0}
+@media(max-width:900px){.side{position:static;width:auto;height:auto}.main{margin-left:0;padding:20px 16px}}
+.evcats{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+.evcat{display:inline-flex;align-items:center;gap:8px;font-family:var(--font);font-size:12.5px;font-weight:600;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:7px 14px;cursor:pointer;transition:all .15s}
+.evcat:hover{border-color:var(--accent-soft);background:var(--surface2)}
+.evcat.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.evcat .c{font-size:11px;font-weight:700;background:var(--surface3);color:var(--muted);border-radius:999px;padding:0 7px}
+.evcat.on .c{background:var(--accent);color:#fff}
+.evcat.zero{color:var(--muted);opacity:.7}
+.evcat .w{width:7px;height:7px;border-radius:999px;background:var(--amber)}.evcat .w.high{background:var(--red)}
+.evhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.evhead .sub{font-size:12px;color:var(--muted);font-weight:500}
+.evnote{font-size:12.5px;color:var(--muted);padding:12px 16px;border-bottom:1px solid var(--border);background:var(--surface2)}
+.w25v{display:flex;align-items:center;gap:16px;padding:16px 18px;border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:18px;background:var(--surface2)}
+.w25v .bar{width:6px;align-self:stretch;border-radius:4px}.w25v .bar.high{background:var(--red)}.w25v .bar.medium{background:var(--amber)}.w25v .bar.ok{background:var(--green)}
+.w25v b{display:block;font-size:16px;margin-bottom:2px}.w25v span{font-size:13px;color:var(--muted)}
+.chk{border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}
+.chk .frow .fh{padding:11px 16px}.chk .frow .fh .res{font-size:12.5px;color:var(--muted);text-align:right;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chk .frow .fh .tg{width:118px;flex-shrink:0}
+.chk .fb{padding:2px 16px 16px 146px}
+.chk .fb .adv{font-size:13px;margin-bottom:10px}
+.chk .fb .tbl-wrap{max-height:300px;border:1px solid var(--border);border-radius:var(--radius-sm)}
+.chk .fb .lnote{font-size:12px;color:var(--muted);margin-top:6px}
+@media(max-width:900px){.chk .fb{padding-left:16px}.chk .frow .fh .res{display:none}}
+.tiss{display:flex;align-items:center;gap:7px;font-size:12.5px;white-space:nowrap;line-height:1.6}
+tr.trow{cursor:pointer}tr.trow .cv{width:12px;height:12px;color:var(--muted);transition:transform .15s}tr.trow.open .cv{transform:rotate(90deg)}tr.trow.open td{background:var(--accent-soft)}
+tr.tdet td{background:var(--surface)!important;padding:12px 16px 16px}
+.w25hero{display:flex;gap:20px;align-items:stretch;padding:20px 22px;border-radius:var(--radius);border:1px solid var(--border);margin-bottom:22px;background:var(--surface2);flex-wrap:wrap}
+.w25hero.high{background:linear-gradient(135deg,var(--red-soft),var(--surface2) 70%)}.w25hero.medium{background:linear-gradient(135deg,var(--amber-soft),var(--surface2) 70%)}.w25hero.ok{background:linear-gradient(135deg,var(--green-soft),var(--surface2) 70%)}
+.w25ico{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0;background:var(--surface)}
+.w25hero.high .w25ico{color:var(--red)}.w25hero.medium .w25ico{color:var(--amber)}.w25hero.ok .w25ico{color:var(--green)}
+.w25txt{flex:1;min-width:260px}.w25t{font-size:19px;font-weight:800;letter-spacing:-.02em}.w25s{font-size:13px;color:var(--muted);margin-top:3px}
+.w25bar{height:8px;background:var(--surface3);border-radius:999px;margin:14px 0 10px;overflow:hidden;max-width:520px}.w25bar div{height:100%;background:var(--green);border-radius:999px}
+.w25pills{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;font-weight:600}.w25pills>span{display:inline-flex;align-items:center;gap:6px}
+.w25path{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 16px;font-size:12.5px;min-width:210px}
+.w25path b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:6px}
+.w25path ol{margin:0;padding-left:18px;line-height:1.75}
+.w25cols{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+@media(max-width:1100px){.w25cols{grid-template-columns:1fr}}
+.w25col{border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;background:var(--surface)}
+.w25ch{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border);background:var(--surface2)}
+.w25ch b{display:block;font-size:13.5px}.w25ch span{font-size:11.5px;color:var(--muted)}
+.w25ci{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.w25ci.high{background:var(--red-soft);color:var(--red)}.w25ci.medium{background:var(--amber-soft);color:var(--amber)}.w25ci.low{background:var(--blue-soft);color:var(--blue)}.w25ci.ok{background:var(--green-soft);color:var(--green)}
+.w25it{display:flex;gap:11px;align-items:flex-start;padding:11px 16px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s}
+.w25it:last-child{border-bottom:none}.w25it:hover{background:var(--surface2)}.w25it.sel{background:var(--accent-soft);box-shadow:inset 3px 0 0 var(--accent)}
+.w25st{width:20px;height:20px;border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0;margin-top:1px}
+.w25st.high{background:var(--red);color:#fff}.w25st.medium{background:var(--amber);color:#fff}.w25st.low{background:var(--blue);color:#fff}.w25st.ok{background:var(--green-soft);color:var(--green)}
+.w25n{font-size:13px;font-weight:600;line-height:1.35}.w25r{font-size:11.5px;color:var(--muted);margin-top:2px;line-height:1.4}
+.w25det:not(:empty){margin-top:18px;border:1px solid var(--accent);border-radius:var(--radius-sm);box-shadow:0 0 0 3px var(--accent-soft);overflow:hidden}
+.w25dh{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--surface2);flex-wrap:wrap}
+.w25dh b{font-size:14px}.w25dh span{font-size:12.5px;color:var(--muted)}
+.w25db{padding:16px}
+.srclink{display:inline-flex;align-items:center;gap:6px;margin-top:14px;font-size:12.5px;font-weight:600;color:var(--accent);text-decoration:none}.srclink:hover{text-decoration:underline}
+.w25note{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:10px}
+.flash{animation:flash 1.2s ease}@keyframes flash{0%{box-shadow:0 0 0 4px var(--accent-soft)}100%{box-shadow:var(--shadow)}}
+</style></head><body>
+<aside class="side">
+  <div class="sbrand"><div class="slogo"><i class="ic" data-i="key"></i></div><div><div class="skick">AD Audit Suite</div><div class="stitle">DC Posture</div></div></div>
+  <div class="smeta" id="topmeta"></div>
+  <div class="sgroup">Report</div>
+  <nav id="secnav"></nav>
+  <div class="sfoot"><button class="sbtn" id="themebtn"><i class="ic" data-i="moon"></i><span id="themetxt">Dark mode</span></button></div>
+</aside>
+<main class="main">
+  <header class="phead anchor" id="sec-overview"><h1>Domain Controller Posture</h1><div class="psub">Protocol hardening, security events, time sync and recovery readiness across all domain controllers</div></header>
+  <div id="coverage"></div>
+  <div class="kpi-grid" id="kpis"></div>
+  <div id="fbanner"></div>
+
+  <section class="sect anchor" id="sec-w25"><div class="sect-head"><i class="ic" data-i="up"></i>Windows Server 2025 readiness <span class="cnt" id="w25cnt"></span></div><div class="sect-body" id="w25"></div></section>
+
+  <section class="sect anchor" id="sec-proto"><div class="sect-head"><i class="ic" data-i="shield"></i>Protocols &amp; hardening<button class="mini-btn" onclick="csvSettings()"><i class="ic" data-i="download"></i>CSV</button></div><div class="sect-body">
+    <div class="layout">
+      <div class="panel-card" style="margin-bottom:0"><div class="list-search"><input id="setq" placeholder="Filter settings..."></div><div class="item-list" id="setlist"></div></div>
+      <div class="panel-card" style="margin-bottom:0"><div class="detail" id="setdetail"></div></div>
+    </div></div></section>
+
+  <section class="sect anchor" id="sec-events"><div class="sect-head"><i class="ic" data-i="journal"></i>Security events <span class="cnt" id="evdays"></span></div><div class="sect-body" id="events"></div></section>
+
+  <section class="sect anchor" id="sec-time"><div class="sect-head"><i class="ic" data-i="clock"></i>Time sync hierarchy</div><div class="sect-body" id="time"></div></section>
+
+  <section class="sect anchor" id="sec-backup"><div class="sect-head"><i class="ic" data-i="archive"></i>Backup &amp; recovery readiness</div><div class="sect-body" id="backup"></div></section>
+</main>
+
+<script>
+var D = $DataJSON;
+function arr(x){if(x==null)return[];if(!Array.isArray(x))return[x];while(x.length===1&&Array.isArray(x[0]))x=x[0];return x;}
+function esc(s){s=(s==null?'':''+s);return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function qs(s){return document.querySelector(s);}
+function plural(n,w){return n+' '+w+(n===1?'':'s');}
+var P='<svg viewBox="0 0 16 16" fill="currentColor">';
+var ICONS={
+ octagon:P+'<path d="M11.46.146A.5.5 0 0 0 11.107 0H4.893a.5.5 0 0 0-.353.146L.146 4.54A.5.5 0 0 0 0 4.893v6.214a.5.5 0 0 0 .146.353l4.394 4.394a.5.5 0 0 0 .353.146h6.214a.5.5 0 0 0 .353-.146l4.394-4.394a.5.5 0 0 0 .146-.353V4.893a.5.5 0 0 0-.146-.353zM8 4c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 4.995A.905.905 0 0 1 8 4m.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2"/></svg>',
+ bulb:P+'<path d="M2 6a6 6 0 1 1 10.174 4.31c-.203.196-.359.4-.453.619l-.762 1.769A.5.5 0 0 1 10.5 13a.5.5 0 0 1 0 1 .5.5 0 0 1 0 1l-.224.447a1 1 0 0 1-.894.553H6.618a1 1 0 0 1-.894-.553L5.5 15a.5.5 0 0 1 0-1 .5.5 0 0 1 0-1 .5.5 0 0 1-.46-.302l-.761-1.77a2 2 0 0 0-.453-.618A5.98 5.98 0 0 1 2 6m6-5a5 5 0 0 0-3.479 8.592c.263.254.514.564.676.941L5.83 12h4.342l.632-1.467c.162-.377.413-.687.676-.941A5 5 0 0 0 8 1"/></svg>',
+ checklist:P+'<path d="M14.5 3a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5h-13a.5.5 0 0 1-.5-.5v-9a.5.5 0 0 1 .5-.5zm-13-1A1.5 1.5 0 0 0 0 3.5v9A1.5 1.5 0 0 0 1.5 14h13a1.5 1.5 0 0 0 1.5-1.5v-9A1.5 1.5 0 0 0 14.5 2z"/><path d="M7 5.5a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5m-1.496-.854a.5.5 0 0 1 0 .708l-1.5 1.5a.5.5 0 0 1-.708 0l-.5-.5a.5.5 0 1 1 .708-.708l.146.147 1.146-1.147a.5.5 0 0 1 .708 0M7 9.5a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5m-1.496-.854a.5.5 0 0 1 0 .708l-1.5 1.5a.5.5 0 0 1-.708 0l-.5-.5a.5.5 0 0 1 .708-.708l.146.147 1.146-1.147a.5.5 0 0 1 .708 0"/></svg>',
+ key:P+'<path d="M3.5 11.5a3.5 3.5 0 1 1 3.163-5H14L15.5 8 14 9.5l-1-1-1 1-1-1-1 1-1-1-1 1H6.663a3.5 3.5 0 0 1-3.163 2M2.5 9a1 1 0 1 0 0-2 1 1 0 0 0 0 2"/></svg>',
+ moon:P+'<path d="M6 .278a.77.77 0 0 1 .08.858 7.2 7.2 0 0 0-.878 3.46c0 4.021 3.278 7.277 7.318 7.277q.792-.001 1.533-.16a.79.79 0 0 1 .81.316.73.73 0 0 1-.031.893A8.35 8.35 0 0 1 8.344 16C3.734 16 0 12.286 0 7.71 0 4.266 2.114 1.312 5.124.06A.75.75 0 0 1 6 .278"/></svg>',
+ sun:P+'<path d="M8 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8M8 0a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 0m0 13a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 13m8-5a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2a.5.5 0 0 1 .5.5M3 8a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2A.5.5 0 0 1 3 8"/></svg>',
+ alert:P+'<path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5m.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2"/></svg>',
+ info:P+'<path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16m.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2"/></svg>',
+ check:P+'<path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0m-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/></svg>',
+ shield:P+'<path d="M5.338 1.59a61 61 0 0 0-2.837.856.48.48 0 0 0-.328.39c-.554 4.157.726 7.19 2.253 9.188a10.7 10.7 0 0 0 2.287 2.233c.346.244.652.42.893.533q.18.085.293.118a1 1 0 0 0 .101.025 1 1 0 0 0 .1-.025q.114-.034.294-.118c.24-.113.547-.29.893-.533a10.7 10.7 0 0 0 2.287-2.233c1.527-1.997 2.807-5.031 2.253-9.188a.48.48 0 0 0-.328-.39c-.651-.213-1.75-.56-2.837-.855C9.552 1.29 8.531 1.067 8 1.067c-.53 0-1.552.223-2.662.524zM5.072.56C6.157.265 7.31 0 8 0s1.843.265 2.928.56c1.11.3 2.229.655 2.887.87a1.54 1.54 0 0 1 1.044 1.262c.596 4.477-.787 7.795-2.465 9.99a11.8 11.8 0 0 1-2.517 2.453 7 7 0 0 1-1.048.625c-.28.132-.581.24-.829.24s-.548-.108-.829-.24a7 7 0 0 1-1.048-.625 11.8 11.8 0 0 1-2.517-2.453C1.928 10.487.545 7.169 1.141 2.692A1.54 1.54 0 0 1 2.185 1.43 63 63 0 0 1 5.072.56"/></svg>',
+ server:P+'<path d="M1.333 2.667C1.333 1.194 4.318 0 8 0s6.667 1.194 6.667 2.667V4c0 1.473-2.985 2.667-6.667 2.667S1.333 5.473 1.333 4z"/><path d="M1.333 6.334v3C1.333 10.805 4.318 12 8 12s6.667-1.194 6.667-2.667V6.334a6.5 6.5 0 0 1-1.458.79C11.81 7.684 9.967 8 8 8s-3.809-.317-5.208-.876a6.5 6.5 0 0 1-1.458-.79z"/><path d="M14.667 11.668a6.5 6.5 0 0 1-1.458.789c-1.4.56-3.242.876-5.21.876-1.966 0-3.809-.316-5.208-.876a6.5 6.5 0 0 1-1.458-.79v1.666C1.333 14.806 4.318 16 8 16s6.667-1.194 6.667-2.667z"/></svg>',
+ list:P+'<path fill-rule="evenodd" d="M5 11.5a.5.5 0 0 1 .5-.5h9a.5.5 0 0 1 0 1h-9a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h9a.5.5 0 0 1 0 1h-9a.5.5 0 0 1-.5-.5m0-4a.5.5 0 0 1 .5-.5h9a.5.5 0 0 1 0 1h-9a.5.5 0 0 1-.5-.5m-3 1a1 1 0 1 0 0-2 1 1 0 0 0 0 2m0 4a1 1 0 1 0 0-2 1 1 0 0 0 0 2m0 4a1 1 0 1 0 0-2 1 1 0 0 0 0 2"/></svg>',
+ journal:P+'<path d="M3 0h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2v-1h1v1a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v1H1V2a2 2 0 0 1 2-2"/><path d="M1 5v-.5a.5.5 0 0 1 1 0V5h.5a.5.5 0 0 1 0 1h-2a.5.5 0 0 1 0-1zm0 3v-.5a.5.5 0 0 1 1 0V8h.5a.5.5 0 0 1 0 1h-2a.5.5 0 0 1 0-1zm0 3v-.5a.5.5 0 0 1 1 0v.5h.5a.5.5 0 0 1 0 1h-2a.5.5 0 0 1 0-1z"/></svg>',
+ clock:P+'<path d="M8 3.5a.5.5 0 0 0-1 0V9a.5.5 0 0 0 .252.434l3.5 2a.5.5 0 0 0 .496-.868L8 8.71z"/><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16m7-8A7 7 0 1 1 1 8a7 7 0 0 1 14 0"/></svg>',
+ archive:P+'<path d="M0 2a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1v7.5a2.5 2.5 0 0 1-2.5 2.5h-9A2.5 2.5 0 0 1 1 12.5V5a1 1 0 0 1-1-1zm2 3v7.5A1.5 1.5 0 0 0 3.5 14h9a1.5 1.5 0 0 0 1.5-1.5V5zm13-3H1v2h14zM5 7.5a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5"/></svg>',
+ download:P+'<path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5"/><path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708z"/></svg>',
+ lock:P+'<path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2m3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2"/></svg>',
+ x:P+'<path d="M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8z"/></svg>',
+ up:P+'<path d="M16 8A8 8 0 1 0 0 8a8 8 0 0 0 16 0m-7.5 3.5a.5.5 0 0 1-1 0V5.707L5.354 7.854a.5.5 0 1 1-.708-.708l3-3a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1-.708.708L8.5 5.707z"/></svg>',
+ people:P+'<path d="M7 14s-1 0-1-1 1-4 5-4 5 3 5 4-1 1-1 1zm4-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6m-5.784 6A2.24 2.24 0 0 1 5 13c0-1.355.68-2.75 1.936-3.72A6.3 6.3 0 0 0 5 9c-4 0-5 3-5 4s1 1 1 1zM4.5 8a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5"/></svg>'
+};
+function ic(n){return '<i class="ic">'+(ICONS[n]||'')+'</i>';}
+function paintIcons(root){Array.prototype.forEach.call((root||document).querySelectorAll('i.ic[data-i]'),function(e){e.innerHTML=ICONS[e.getAttribute('data-i')]||'';e.removeAttribute('data-i');});}
+var SEVMAP={crit:'high',warn:'medium',info:'low',ok:'ok'};
+var SEVWORD={crit:'Critical',warn:'Warning',info:'Recommendation',ok:'OK'};
+var RANK={crit:3,warn:2,info:1,ok:0,'':-1};
+function worstOf(l){var w='';l.forEach(function(s){if(s&&RANK[s]>RANK[w])w=s;});return w;}
+function tag(sev,txt){return '<span class="tag '+(sev==='crit'?'high':(sev==='warn'?'warn':(sev==='info'?'low':(sev==='ok'?'ok':'mut'))))+'">'+esc(txt)+'</span>';}
+function dl(name,rows){var csv='\ufeff'+rows.map(function(r){return r.map(function(c){c=(c==null?'':''+c);return '"'+c.replace(/"/g,'""')+'"';}).join(',');}).join('\r\n');var b=new Blob([csv],{type:'text/csv'});var u=URL.createObjectURL(b);var a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(u);}
+
+var DCS=arr(D.dcs), EV=D.events||{}, BK=D.backup||{}, DES=arr(D.desOnly);
+qs('#topmeta').innerHTML='<div>Domain<b>'+esc(D.domain)+'</b></div><div>PDC emulator<b>'+esc(D.pdc)+'</b></div><div>Generated<b>'+esc(D.generated)+'</b></div>';
+qs('#themebtn').onclick=function(){var d=document.documentElement.getAttribute('data-theme')==='dark';document.documentElement.setAttribute('data-theme',d?'light':'dark');qs('#themetxt').textContent=d?'Dark mode':'Light mode';qs('#themebtn i').innerHTML=ICONS[d?'moon':'sun'];};
+
+/* ---------------- settings metadata ---------------- */
+var SET=[
+ ['ldapSign','LDAP signing','Whether the domain controller requires LDAP clients to sign their binds. Unsigned binds can be intercepted and relayed.','Required'],
+ ['ldapCbt','LDAP channel binding','Ties LDAPS sessions to the TLS channel so credentials cannot be relayed over LDAPS.','Always'],
+ ['ldaps','LDAPS certificate','Tested from the machine that ran this report: port 636 and the certificate it presents.','Valid certificate, not expiring within 30 days'],
+ ['ntlmLevel','NTLM level','LAN Manager authentication level (LmCompatibilityLevel). Below 5 the DC still accepts LM and NTLMv1.','5 - Send NTLMv2 only, refuse LM & NTLM'],
+ ['ntlmAudit','NTLM auditing','Auditing or restricting NTLM in the domain shows which clients still depend on it.','Auditing enabled, then restriction'],
+ ['noLm','LM hash storage','Whether LM password hashes (trivially crackable) are stored.','Not stored'],
+ ['smbSign','SMB signing','Required SMB signing blocks NTLM relay to the domain controller over SMB.','Required'],
+ ['smb1','SMBv1','The legacy SMB 1.0 protocol.','Disabled / removed'],
+ ['tls','SSL / TLS protocols','Server-side Schannel protocol settings. "default" means not configured, so the OS default applies.','SSL 2.0/3.0 and TLS 1.0/1.1 off, TLS 1.2 on'],
+ ['llmnr','LLMNR','Link-Local Multicast Name Resolution, a common name-poisoning target.','Disabled'],
+ ['netbios','NetBIOS over TCP/IP','NetBIOS name resolution on the DC network adapters.','Disabled'],
+ ['wdigest','WDigest','When on, clear-text passwords are kept in memory.','Disabled'],
+ ['lsaPpl','LSA protection','Runs LSASS as a protected process to resist credential dumping.','Enabled'],
+ ['kerbEnc','Kerberos encryption types','Encryption types the DC allows for Kerberos.','AES only'],
+ ['spooler','Print Spooler','A running spooler on a DC enables authentication coercion attacks.','Stopped and disabled']];
+function dcSetting(dc,id){var r=null;arr(dc.settings).forEach(function(s){if(s.id===id)r=s;});return r;}
+function roleTxt(dc){return (dc.isPdc?'PDC emulator':'Domain controller')+(dc.rodc?' (read-only)':'');}
+function offTxt(o){o=+o;return (o>=0?'+':'')+o.toFixed(3)+' s';}
+var TSL=BK.tombstone||180;
+function partSev(p){if(p.error&&p.days==null)return 'info';if(p.days==null)return 'crit';if(p.days>TSL/2)return 'crit';if(p.days>7)return 'warn';return 'ok';}
+
+/* ---------------- aggregate findings ---------------- */
+var F={};
+function addF(sec,sev,title,advice,who){var k=sec+'|'+title;if(!F[k])F[k]={sec:sec,sev:sev,title:title,advice:advice,who:[]};var f=F[k];if(RANK[sev]>RANK[f.sev])f.sev=sev;if(!f.advice)f.advice=advice;if(who&&f.who.indexOf(who)<0)f.who.push(who);}
+DCS.forEach(function(dc){
+  arr(dc.settings).forEach(function(s){if(s.sev!=='ok')addF('proto',s.sev,s.title,s.advice,dc.short);});
+  arr((dc.time||{}).findings).forEach(function(t){addF('time',t.sev,t.title,t.advice,dc.short);});
+  if(!dc.regRead)addF('proto','info','Settings could not be read on some DCs','Run the report from a host that can reach these DCs over DCOM (or WinRM) with admin rights.',dc.short);
+});
+DES.forEach(function(a){addF('proto','crit','Accounts restricted to DES Kerberos','Clear "Use only Kerberos DES encryption types" on these accounts and reset their passwords so AES keys are created.',a.name);});
+if(EV.collected){
+  arr(EV.lockouts).forEach(function(x){if(x.count>=5)addF('events','warn','Accounts locked out repeatedly','Find the device or service still using an old password (see the caller computers) and update it.',x.name);});
+  arr(EV.failSources).forEach(function(x){if(x.distinct>=10)addF('events','warn','Possible password spraying','Identify the source machine and investigate; consider blocking it and resetting passwords for targeted accounts.',x.name);});
+  arr(EV.privChanges).forEach(function(c){addF('events','warn','Privileged group membership changed','Confirm each change was authorised.',c.member+' '+c.action+' '+(c.action==='added'?'to':'from')+' '+c.group);});
+  arr(EV.cleared).forEach(function(c){addF('events','crit','Security log was cleared','Confirm who cleared the log and why; this is a common step to hide an intrusion.',c.dc);});
+  arr(EV.ldapDc).forEach(function(x){if(x.simple>0||x.unsignedSasl>0)addF('events','warn','Clients using unsigned or clear-text LDAP','Move these clients to LDAPS or signed binds, then require LDAP signing. Enable LDAP interface diagnostic logging to see each client (event 2889).',x.dc);});
+  arr(EV.failed).forEach(function(f){addF('events','info','Event logs could not be read on some DCs','Check RPC access and Event Log Readers rights from the host running the report.',f.dc);});
+}
+var rbSev=BK.recycleBin===false?'info':(BK.recycleBinEnabled?'ok':'warn');
+if(rbSev==='warn')addF('backup','warn','AD Recycle Bin not enabled','Enable the AD Recycle Bin so deleted objects can be restored with all their attributes. It requires forest functional level 2008 R2 or higher and cannot be turned off afterwards.','Forest');
+if(TSL<180)addF('backup','info','Tombstone lifetime below 180 days','Consider raising the tombstone lifetime to 180 days to widen the window for restores.','Forest');
+var SV=BK.sysvol||{};
+if(SV.sev==='crit')addF('backup','crit','SYSVOL still replicated by FRS','Migrate SYSVOL replication from FRS to DFSR. FRS is deprecated and newer Windows Server versions cannot be promoted in an FRS domain.','Domain');
+if(SV.sev==='warn')addF('backup','warn','SYSVOL migration to DFSR not finished','Complete the SYSVOL migration to the Eliminated state.','Domain');
+arr(BK.partitions).forEach(function(p){var s=partSev(p);if(s==='crit'||s==='warn')addF('backup',s,s==='crit'?(p.days==null?'Partition never backed up':'Last backup older than half the tombstone lifetime'):'No backup in the last 7 days','Back up at least one domain controller (system state) regularly - daily is typical - and well within the tombstone lifetime.',p.name);});
+/* ---------------- readiness checks: Windows Server 2025 + Kerberos RC4 hardening ---------------- */
+var W=D.w25||{}, FLNAME={0:'2000',1:'2003 interim',2:'2003',3:'2008',4:'2008 R2',5:'2012',6:'2012 R2',7:'2016',10:'2025'};
+function flTxt(v){return v==null?'unknown':('Windows Server '+(FLNAME[v]||('level '+v)));}
+var MS={
+ whatsnew:{u:'https://learn.microsoft.com/windows-server/get-started/whats-new-windows-server-2025',t:"What's new in Windows Server 2025 (AD DS functional levels)"},
+ fl:{u:'https://learn.microsoft.com/windows-server/identity/ad-ds/active-directory-functional-levels',t:'Active Directory functional levels'},
+ frs:{u:'https://learn.microsoft.com/windows-server/storage/dfs-replication/migrate-sysvol-to-dfsr',t:'Migrate SYSVOL replication to DFS Replication'},
+ removed:{u:'https://learn.microsoft.com/windows-server/get-started/removed-deprecated-features-windows-server',t:'Features removed or deprecated in Windows Server'},
+ exch:{u:'https://learn.microsoft.com/exchange/plan-and-deploy/supportability-matrix',t:'Exchange Server supportability matrix'},
+ rc4:{u:'https://learn.microsoft.com/windows-server/security/kerberos/detect-remediate-rc4-kerberos',t:'Detect and remediate RC4 usage in Kerberos'},
+ kb:{u:'https://support.microsoft.com/topic/1ebcda33-720a-4da8-93c1-b0496e1910dc',t:'KDC usage of RC4 - changes related to CVE-2026-20833'}
+};
+var CHK=[], CURG='w25', CURS=null;
+function wc(sev,title,result,advice,cols,rows,note,noF){rows=rows||[];CHK.push({grp:CURG,src:CURS,sev:sev,title:title,result:result,advice:advice||'',cols:cols||[],rows:rows,note:note||''});
+  if(sev==='ok'||noF)return;
+  if(rows.length)rows.forEach(function(r){addF(CURG,sev,title,advice,''+r[0]);});else addF(CURG,sev,title,advice,result);}
+var W25C=CHK; /* kept for compatibility */
+(function(){
+  if(!D.w25)return;
+  /* ===== Windows Server 2025 readiness: Microsoft-documented requirements only ===== */
+  CURG='w25'; CURS=MS.whatsnew;
+  [['Forest functional level',W.ffl,'forest'],['Domain functional level',W.dfl,'domain']].forEach(function(x){
+    if(x[1]==null)wc('info',x[0],'Could not be read','Check the functional level manually before planning the migration.',[],[]);
+    else if(x[1]>=7)wc('ok',x[0],flTxt(x[1]),'',[],[]);
+    else wc('crit',x[0]+' too low',flTxt(x[1])+' (2016 required)','Microsoft requires the '+x[2]+' functional level to be Windows Server 2016 or later before a Windows Server 2025 domain controller can be promoted. Raising it first requires every domain controller in the '+x[2]+' to run Windows Server 2016 or later.',[],[]);});
+  CURS=MS.fl;
+  var dcs=arr(W.dcs), bad=dcs.filter(function(d){return !d.ok;});
+  var osCount={};dcs.forEach(function(d){osCount[d.os]=(osCount[d.os]||0)+1;});
+  var osTxt=Object.keys(osCount).map(function(k){return osCount[k]+' x '+k.replace('Windows Server ','WS ');}).join(', ');
+  var dcRows=dcs.slice().sort(function(a,b){return (a.ok-b.ok)||(''+a.name).localeCompare(''+b.name);}).map(function(d){return [d.name,d.domain,d.os,d.ok?tag('ok','supported'):tag('crit','too old')];});
+  if(!dcs.length)wc('info','Domain controller versions','Could not be listed','',[],[]);
+  else if(bad.length)wc('crit','Domain controllers older than Windows Server 2016',bad.length+' of '+plural(dcs.length,'DC'),'Retire or upgrade these domain controllers first. Functional level 2016, which Windows Server 2025 requires, cannot be reached while they remain.',['Domain controller','Domain','Operating system','Status'],dcRows);
+  else wc('ok','Domain controller versions',osTxt,'',['Domain controller','Domain','Operating system','Status'],dcRows);
+  CURS=MS.frs;
+  var sv=BK.sysvol||{};
+  if(sv.sev==='ok')wc('ok','SYSVOL replication',sv.mode+' - '+sv.state,'',[],[]);
+  else if(sv.sev)wc('crit','SYSVOL not fully on DFSR',sv.state,'Complete the SYSVOL migration from FRS to DFSR (Eliminated state). FRS is no longer available in current Windows Server versions, so a Windows Server 2025 domain controller cannot be promoted while SYSVOL still uses FRS.',[],[]);
+  CURS=MS.removed;
+  var des=arr(D.desOnly);
+  if(des.length)wc('crit','Accounts restricted to DES',plural(des.length,'account'),'DES is removed from Windows Server 2025. Clear "Use only Kerberos DES encryption types" on these accounts and reset their passwords so AES keys are created.',['Account','Name'],des.map(function(a){return [a.sam,a.name];}),'',true);
+  else wc('ok','No accounts restricted to DES','','',[],[]);
+  var nt=DCS.filter(function(dc){var s=dcSetting(dc,'ntlmLevel');return s&&s.sev!=='ok';});
+  if(nt.length)wc('warn','Domain controllers still accept NTLMv1',plural(nt.length,'DC'),'NTLMv1 is removed from Windows Server 2025, so any client still using it will fail against a Windows Server 2025 domain controller. Find NTLMv1 clients (NTLM auditing), fix them, then raise the LAN Manager authentication level on all domain controllers.',['Domain controller','Current level'],nt.map(function(dc){return [dc.short,dcSetting(dc,'ntlmLevel').value];}));
+  else if(DCS.some(function(dc){return dcSetting(dc,'ntlmLevel');}))wc('ok','Domain controllers refuse NTLMv1','','',[],[]);
+  CURS=MS.exch;
+  var ex=arr(W.exchange);
+  function exBuild(e){var m=/Build\s+(\d+)/i.exec(e.version||'');return m?+m[1]:null;}
+  var exOld=ex.filter(function(e){var v=e.ver||'';if(v.indexOf('14.')===0||v.indexOf('15.0')===0||v.indexOf('15.1')===0)return true;var b=exBuild(e);return v.indexOf('15.2')===0&&b!=null&&b<1544;});
+  var exRows=ex.map(function(e){var b=exBuild(e),old=exOld.indexOf(e)>=0;return [e.name,(e.ver==='15.2'&&b!=null&&b<1544)?'Exchange 2019 (before CU14)':e.label,e.version,old?tag('crit','not supported'):tag('ok','supported')];});
+  if(exOld.length)wc('crit','Exchange version not supported with Windows Server 2025 DCs',plural(exOld.length,'server'),'Microsoft supports Windows Server 2025 domain controllers only with Exchange Server 2019 CU14 or later, or Exchange Server SE. Upgrade or migrate these servers before introducing Windows Server 2025 domain controllers.',['Server','Version','Build','Status'],exRows);
+  else if(ex.length)wc('ok','Exchange version supported',plural(ex.length,'server'),'',['Server','Version','Build','Status'],exRows);
+  CURS=null;
+  if(W.schema!=null)wc('ok','Schema version',W.schema+(W.schema>=91?' (Windows Server 2025)':' - updated automatically when the first Windows Server 2025 DC is promoted'),'',[],[]);
+
+  CURG='w25'; CURS=null;
+})();
+
+var FL=Object.keys(F).map(function(k){return F[k];}).sort(function(a,b){return (RANK[b.sev]-RANK[a.sev])||(b.who.length-a.who.length);});
+var SECNAME={w25:'Server 2025 readiness',proto:'Protocols & hardening',dcs:'Domain controllers',events:'Security events',time:'Time sync',backup:'Backup & recovery'};
+function findingHtml(f){var cls=SEVMAP[f.sev];
+  return '<div class="finding '+cls+'">'+ic(f.sev==='info'?'info':'alert')+'<div style="flex:1;min-width:0"><b>'+esc(f.title)+'</b>'+esc(f.advice)+
+    (f.who.length?'<div class="aff">'+esc(SECNAME[f.sec])+' &middot; '+esc(f.who.slice(0,12).join(', '))+(f.who.length>12?' +'+(f.who.length-12)+' more':'')+'</div>':'')+'</div></div>';}
+function jump(sec){var el=qs('#sec-'+sec);if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}}
+
+/* ---------------- KPIs + filter banner ---------------- */
+var nC=FL.filter(function(f){return f.sev==='crit';}),nW=FL.filter(function(f){return f.sev==='warn';}),nI=FL.filter(function(f){return f.sev==='info';});
+var reach=DCS.filter(function(d){return d.regRead;}).length;
+var KPIS=[
+ {k:'dcs',icon:'server',cls:'k-blue',val:DCS.length,lbl:'Domain controllers'},
+ {k:'read',icon:'checklist',cls:reach===DCS.length?'k-green':'k-amber',val:reach+' / '+DCS.length,lbl:'Settings read'},
+ {k:'crit',icon:'octagon',cls:'k-red',val:nC.length,lbl:'Critical findings',list:nC},
+ {k:'warn',icon:'alert',cls:'k-amber',val:nW.length,lbl:'Warnings',list:nW},
+ {k:'info',icon:'bulb',cls:'k-blue',val:nI.length,lbl:'Recommended changes',list:nI}];
+qs('#kpis').innerHTML=KPIS.map(function(k){return '<div class="kpi '+k.cls+(k.list?' clickable':'')+'" data-k="'+k.k+'"><div class="chip">'+ic(k.icon)+'</div><div class="body"><div class="val">'+k.val+'</div><div class="lbl">'+k.lbl+'</div>'+(k.list?'<div class="hint">Click to list</div>':'')+'</div></div>';}).join('');
+var curK='';
+Array.prototype.forEach.call(document.querySelectorAll('.kpi.clickable'),function(el){el.onclick=function(){var k=el.getAttribute('data-k');curK=(curK===k)?'':k;
+  Array.prototype.forEach.call(document.querySelectorAll('.kpi'),function(x){x.classList.toggle('active',x.getAttribute('data-k')===curK);});
+  if(!curK){qs('#fbanner').innerHTML='';return;}
+  var K=KPIS.filter(function(x){return x.k===curK;})[0];
+  qs('#fbanner').innerHTML='<div class="filter-banner"><div class="filter-banner-head">'+ic(K.icon)+K.lbl+' ('+K.list.length+')<button class="mini-btn" onclick="document.querySelector(\'.kpi.active\').click()">'+ic('x')+'Close</button></div><div class="fb-list">'+
+    (K.list.length?K.list.map(function(f){return '<div class="fb-row" onclick="jump(\''+f.sec+'\')"><span class="dot '+SEVMAP[f.sev]+'"></span><span class="nm">'+esc(f.title)+'</span><span class="cx">'+esc(SECNAME[f.sec])+'</span><span class="cx">'+plural(f.who.length,'item')+'</span></div>';}).join(''):'<div class="muted-note">Nothing in this category.</div>')+'</div></div>';};});
+if(DCS.some(function(d){return !d.regRead;}))qs('#coverage').innerHTML='<div class="banner-note">'+ic('alert')+'Settings could not be read on '+DCS.filter(function(d){return !d.regRead;}).map(function(d){return esc(d.short);}).join(', ')+' (remote management not reachable). Those DCs are listed but only partially assessed.</div>';
+
+/* ---------------- priority findings ---------------- */
+var CHEV='<svg class="cv" viewBox="0 0 16 16" fill="currentColor"><path d="M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708"/></svg>';
+var WHONOUN={proto:'DC',dcs:'DC',events:'item',time:'DC',backup:'item'};
+function frow(f){var n=f.who.length, noun=(f.title.indexOf('Accounts')===0?'account':(f.title.indexOf('Partition')===0||f.title.indexOf('No backup')===0||f.title.indexOf('Last backup')===0?'partition':WHONOUN[f.sec]));
+  return '<div class="frow"><div class="fh" onclick="this.parentNode.classList.toggle(\'open\')"><span class="dot '+SEVMAP[f.sev]+'"></span><span class="t">'+esc(f.title)+'</span><span class="m">'+plural(n,noun)+'</span><span class="s">'+esc(SECNAME[f.sec])+'</span>'+CHEV+'</div>'+
+    '<div class="fb">'+esc(f.advice)+'<div class="who">'+esc(f.who.slice(0,30).join(', '))+(n>30?' +'+(n-30)+' more':'')+'</div><a onclick="jump(\''+f.sec+'\')">Go to '+esc(SECNAME[f.sec])+' &rarr;</a></div></div>';}
+
+
+/* ---------------- protocols: master-detail ---------------- */
+var setSel=null;
+function setStats(id){var list=DCS.map(function(dc){return {dc:dc,s:dcSetting(dc,id)};}).filter(function(x){return x.s;});var bad=list.filter(function(x){return x.s.sev!=='ok';});return {list:list,bad:bad,w:worstOf(bad.map(function(x){return x.s.sev;}))};}
+function renderSetList(){var q=(qs('#setq').value||'').toLowerCase();
+  var items=SET.map(function(m){var st=setStats(m[0]);var sev=st.list.length?(st.w||'ok'):'';
+    return '<div class="item'+(setSel===m[0]?' sel':'')+(q&&m[1].toLowerCase().indexOf(q)<0?' hide':'')+'" onclick="selSet(\''+m[0]+'\')"><div class="item-ico sev-'+(SEVMAP[sev]||'ok')+'">'+ic(sev==='ok'?'check':(sev?'alert':'info'))+'</div><div class="item-body"><div class="item-name">'+esc(m[1])+'</div><div class="item-sub">'+(st.list.length?(st.bad.length?st.bad.length+' of '+plural(st.list.length,'DC')+' not as recommended':'All '+plural(st.list.length,'DC')+' as recommended'):'Not read')+'</div></div></div>';});
+  var desSev=DES.length?'crit':'ok';
+  items.push('<div class="item'+(setSel==='des'?' sel':'')+(q&&'des-only accounts'.indexOf(q)<0?' hide':'')+'" onclick="selSet(\'des\')"><div class="item-ico sev-'+SEVMAP[desSev]+'">'+ic(DES.length?'alert':'check')+'</div><div class="item-body"><div class="item-name">DES-only accounts</div><div class="item-sub">'+plural(DES.length,'account')+'</div></div></div>');
+  qs('#setlist').innerHTML=items.join('');}
+function selSet(id){setSel=id;renderSetList();var h;
+  if(id==='des'){h='<div class="detail-head"><div class="detail-title"><span class="dot '+(DES.length?'high':'ok')+'"></span>DES-only accounts</div><div class="detail-sub">Accounts flagged "Use only Kerberos DES encryption types"</div></div><div class="detail-body">'+
+    (DES.length?'<div class="dsec"><div class="dsec-t">Accounts</div><div class="tbl-wrap"><table class="tbl"><tr><th>Name</th><th>Account</th></tr>'+DES.map(function(a){return '<tr><td>'+esc(a.name)+'</td><td class="mono">'+esc(a.sam)+'</td></tr>';}).join('')+'</table></div></div><div class="dsec"><div class="dsec-t">Recommendation</div><div class="findings">'+findingHtml({sec:'proto',sev:'crit',title:'Remove DES',advice:'Clear "Use only Kerberos DES encryption types" on these accounts and reset their passwords so AES keys are created.',who:[]})+'</div></div>':'<div class="no-findings">'+ic('check')+'No accounts are restricted to DES.</div>')+'</div>';
+    qs('#setdetail').innerHTML=h;return;}
+  var m=SET.filter(function(x){return x[0]===id;})[0], st=setStats(id);
+  var advs={};st.bad.forEach(function(x){if(x.s.advice)advs[x.s.advice]=x.s;});
+  h='<div class="detail-head"><div class="detail-title"><span class="dot '+(SEVMAP[st.w]||'ok')+'"></span>'+esc(m[1])+'</div><div class="detail-sub">'+esc(m[2])+'</div></div><div class="detail-body">'+
+    '<div class="dsec"><div class="kv-grid"><div class="kv"><div class="k">Recommended</div><div class="v">'+esc(m[3])+'</div></div><div class="kv"><div class="k">Domain controllers</div><div class="v '+(st.bad.length?'warn':'good')+'">'+(st.list.length?(st.bad.length?st.bad.length+' of '+st.list.length+' not as recommended':'All as recommended'):'Not read')+'</div></div></div></div>'+
+    (st.list.length?'<div class="dsec"><div class="dsec-t">Per domain controller</div><div class="tbl-wrap"><table class="tbl"><tr><th>DC</th><th>Value</th><th>Status</th></tr>'+st.list.map(function(x){return '<tr><td><b>'+esc(x.dc.short)+'</b></td><td class="mono">'+esc(x.s.value)+'</td><td>'+tag(x.s.sev,x.s.sev==='ok'?'OK':SEVWORD[x.s.sev])+'</td></tr>';}).join('')+'</table></div></div>':'')+
+    (Object.keys(advs).length?'<div class="dsec"><div class="dsec-t">Recommendation</div><div class="findings">'+Object.keys(advs).map(function(a){var s=advs[a];return findingHtml({sec:'proto',sev:s.sev,title:s.title,advice:a,who:[]});}).join('')+'</div></div>':'')+'</div>';
+  qs('#setdetail').innerHTML=h;}
+qs('#setq').addEventListener('input',renderSetList);
+renderSetList();(function(){var first=SET.map(function(m){return {id:m[0],st:setStats(m[0])};}).sort(function(a,b){return RANK[b.st.w||'ok']-RANK[a.st.w||'ok'];})[0];selSet(first?first.id:'ldapSign');})();
+
+/* ---------------- security events: one table, filtered by category ---------------- */
+function panel(icon,title,sub,body,csv){return '<div class="panel-card"><div class="panel-head">'+ic(icon)+title+(sub?' <span class="sub">'+sub+'</span>':'')+(csv?'<button class="mini-btn" onclick="'+csv+'">'+ic('download')+'CSV</button>':'')+'</div>'+body+'</div>';}
+function othTxt(x){return arr(x.others).slice(0,4).map(function(o){return esc(o.name)+' <span style="color:var(--muted)">('+o.count+')</span>';}).join(', ')+(arr(x.others).length>4?' &hellip;':'');}
+function othCsv(x){return arr(x.others).map(function(o){return o.name+' ('+o.count+')';}).join(' | ');}
+var EVC=[];
+(function(){
+  if(!D.events){qs('#events').innerHTML='<div class="muted-note">Event data is missing from this report. Re-run the latest version of the script.</div>';return;}
+  if(!EV.collected){qs('#events').innerHTML='<div class="muted-note">Security events were not collected'+(EV.skipped?' (the script was run with -SkipEvents)':'')+'.</div>';return;}
+  qs('#evdays').textContent='last '+plural(EV.days,'day');
+  var ld=arr(EV.ldapDc).filter(function(x){return x.simple>0||x.unsignedSasl>0;});
+  EVC=[
+   {k:'lock',label:'Account lockouts',sub:'Event 4740 &middot; accounts locked out, with the computers the bad passwords came from',rows:arr(EV.lockouts),
+    cols:['Account','Lockouts','Caller computers','Domain controllers','Last'],
+    cell:function(x){return ['<b>'+esc(x.name||'(empty)')+'</b>'+(x.count>=5?' '+tag('warn','repeated'):''),x.count,othTxt(x),esc(arr(x.dcs).join(', ')),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,othCsv(x),arr(x.dcs).join(' | '),x.last];},num:[1],sev:function(x){return x.count>=5?'warn':'';}},
+   {k:'fsrc',label:'Failed logons by source',sub:'Event 4625 &middot; a source trying 10 or more accounts is flagged as possible password spraying',rows:arr(EV.failSources),
+    cols:['Source','Attempts','Accounts','Accounts tried','Last'],
+    cell:function(x){return ['<b>'+esc(x.name||'(empty)')+'</b>'+(x.distinct>=10?' '+tag('warn','possible spray'):''),x.count,x.distinct,othTxt(x),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,x.distinct,othCsv(x),x.last];},num:[1,2],sev:function(x){return x.distinct>=10?'warn':'';}},
+   {k:'facc',label:'Failed logons by account',sub:'Event 4625 &middot; '+plural(EV.failTotal||0,'failed logon')+' in total',rows:arr(EV.failAccounts),
+    cols:['Account','Attempts','Sources','Last'],cell:function(x){return ['<b>'+esc(x.name||'(empty)')+'</b>',x.count,othTxt(x),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,othCsv(x),x.last];},num:[1],sev:function(){return '';}},
+   {k:'kerb',label:'Kerberos pre-auth failures',sub:'Event 4771 &middot; mostly wrong passwords over Kerberos, '+plural(EV.kerbTotal||0,'event')+' in total',rows:arr(EV.kerbAccounts),
+    cols:['Account','Failures','Source addresses','Last'],cell:function(x){return ['<b>'+esc(x.name||'(empty)')+'</b>',x.count,othTxt(x),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,othCsv(x),x.last];},num:[1],sev:function(){return '';}},
+   {k:'priv',label:'Privileged group changes',sub:'Events 4728 / 4732 / 4756 and removals &middot; confirm every change was authorised',rows:arr(EV.privChanges),
+    cols:['When','Group','Member','Action','Changed by','DC'],cell:function(c){return [esc(c.time),'<b>'+esc(c.group)+'</b>',esc(c.member),tag(c.action==='added'?'warn':'info',c.action),esc(c.by),esc(c.dc)];},
+    csv:function(c){return [c.time,c.group,c.member,c.action,c.by,c.dc];},num:[],sev:function(){return 'warn';}},
+   {k:'clear',label:'Audit log cleared',sub:'Event 1102 &middot; the security log was cleared on a domain controller',rows:arr(EV.cleared),
+    cols:['When','DC','Cleared by'],cell:function(c){return [esc(c.time),'<b>'+esc(c.dc)+'</b>',esc(c.by)];},
+    csv:function(c){return [c.time,c.dc,c.by];},num:[],sev:function(){return 'crit';}},
+   {k:'ldap',label:'Unsigned / clear-text LDAP',sub:'Events 2887 / 2889 &middot; clients that will break when LDAP signing is required',rows:arr(EV.ldapClients),
+    note:ld.length?('Last 24-hour summary: '+ld.map(function(x){return '<b>'+esc(x.dc)+'</b> '+x.simple+' simple / '+x.unsignedSasl+' unsigned SASL binds';}).join(' &middot; ')+(arr(EV.ldapClients).length?'':' &mdash; per-client events (2889) appear only when LDAP interface diagnostic logging is raised on the DCs.')):'',
+    extra:ld.length,
+    cols:['Client (account)','Binds','Bind type','Domain controllers','Last'],cell:function(x){return ['<b>'+esc(x.name)+'</b>',x.count,othTxt(x),esc(arr(x.dcs).join(', ')),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,othCsv(x),arr(x.dcs).join(' | '),x.last];},num:[1],sev:function(){return 'warn';}}];
+  var h='';
+  if(arr(EV.failed).length)h+='<div class="banner-note">'+ic('alert')+'Not read on: '+arr(EV.failed).map(function(f){return esc(f.dc)+' ('+esc(f.reason)+')';}).join(', ')+'</div>';
+  h+='<div class="evcats">'+EVC.map(function(c,i){var n=c.rows.length, w=worstOf(c.rows.map(c.sev));
+     return '<button class="evcat'+(n||c.extra?'':' zero')+'" data-i="'+i+'">'+(w&&n?'<span class="w '+SEVMAP[w]+'"></span>':'')+esc(c.label)+'<span class="c">'+n+'</span></button>';}).join('')+'</div>';
+  h+='<div class="panel-card" style="margin-bottom:0"><div class="panel-head evhead" id="evhead"></div><div id="evbody"></div></div>';
+  qs('#events').innerHTML=h;
+  Array.prototype.forEach.call(document.querySelectorAll('.evcat'),function(b){b.onclick=function(){showEv(+b.getAttribute('data-i'));};});
+  var first=0;for(var i=0;i<EVC.length;i++){if(EVC[i].rows.length){first=i;break;}}
+  showEv(first);
+})();
+var EVCUR=0;
+function showEv(i){EVCUR=i;var c=EVC[i];
+  Array.prototype.forEach.call(document.querySelectorAll('.evcat'),function(b){b.classList.toggle('on',+b.getAttribute('data-i')===i);});
+  qs('#evhead').innerHTML=ic('journal')+'<span>'+esc(c.label)+'</span><span class="sub">'+c.sub+'</span>'+(c.rows.length?'<button class="mini-btn" onclick="csvEv()">'+ic('download')+'CSV</button>':'');
+  var body=(c.note?'<div class="evnote">'+c.note+'</div>':'');
+  if(!c.rows.length){body+='<div class="panel-body"><div class="no-findings">'+ic('check')+'Nothing recorded in this period.</div></div>';}
+  else{var LIM=10;
+    body+='<div class="tbl-wrap"><table class="tbl"><tr>'+c.cols.map(function(h,ci){return '<th'+(c.num.indexOf(ci)>=0?' style="text-align:right"':'')+'>'+h+'</th>';}).join('')+'</tr>'+
+      c.rows.map(function(x,ri){var cells=c.cell(x);return '<tr'+(ri>=LIM?' class="rowhide evx"':'')+'>'+cells.map(function(v,ci){return '<td'+(c.num.indexOf(ci)>=0?' class="num"':'')+'>'+v+'</td>';}).join('')+'</tr>';}).join('')+'</table></div>'+
+      (c.rows.length>LIM?'<button class="tmore" onclick="Array.prototype.forEach.call(document.querySelectorAll(\'.evx\'),function(e){e.classList.remove(\'rowhide\');});this.style.display=\'none\';">Show '+(c.rows.length-LIM)+' more</button>':'');}
+  qs('#evbody').innerHTML=body;}
+function csvEv(){var c=EVC[EVCUR];var rows=[c.cols];c.rows.forEach(function(x){rows.push(c.csv(x));});dl('events_'+c.k+'.csv',rows);}
+
+/* ---------------- readiness boards (Windows Server 2025 + Kerberos RC4) ---------------- */
+var BOARDS={
+ w25:{cats:[['platform','Platform','server','Functional levels, domain controllers, SYSVOL and schema'],['removed','Removed in Windows Server 2025','x','DES and NTLMv1 are removed in Windows Server 2025'],['apps','Applications','people','Exchange Server support for 2025 domain controllers']],
+   catOf:function(c){var x=c.title.toLowerCase();if(/des\b|ntlmv1/.test(x))return 'removed';if(/exchange/.test(x))return 'apps';return 'platform';},
+   hero:function(nC,nW){return nC?['Not ready yet','Resolve the '+plural(nC,'blocker')+' before promoting the first Windows Server 2025 domain controller.']:(nW?['Ready, with risks to address','Nothing blocks the migration, but address the risks below first.']:['Ready for Windows Server 2025','No blockers or risks found.']);},
+   path:['Resolve blockers','Add new 2025 DCs','Move FSMO roles','Retire older DCs'],
+   note:'Only requirements documented by Microsoft are checked here. Each check links to its Microsoft source.'}
+};
+var BSEL={};
+function renderBoard(key){
+  var cfg=BOARDS[key],el=qs('#'+key);if(!el)return;
+  if(!D.w25){el.innerHTML='<div class="muted-note">These checks were not collected by this version of the script.</div>';return;}
+  var order={crit:0,warn:1,info:2,ok:3};
+  var list=CHK.filter(function(c){return c.grp===key;});
+  CHK.forEach(function(c,i){c.i=i;});list.forEach(function(c){c.cat=cfg.catOf(c);});
+  var nC=list.filter(function(c){return c.sev==='crit';}).length,nW=list.filter(function(c){return c.sev==='warn';}).length,nI=list.filter(function(c){return c.sev==='info';}).length,nOk=list.filter(function(c){return c.sev==='ok';}).length,N=list.length;
+  var cnt=qs('#'+key+'cnt');if(cnt)cnt.textContent=nOk+' / '+N+' passed';
+  var vs=nC?'high':(nW?'medium':'ok'),hv=cfg.hero(nC,nW),pct=N?Math.round(nOk*100/N):0;
+  var h='<div class="w25hero '+vs+'"><div class="w25ico">'+ic(nC?'x':(nW?'alert':'check'))+'</div><div class="w25txt"><div class="w25t">'+hv[0]+'</div><div class="w25s">'+hv[1]+'</div>'+
+    '<div class="w25bar"><div style="width:'+pct+'%"></div></div><div class="w25pills">'+
+    '<span><span class="dot high"></span>'+plural(nC,key==='w25'?'blocker':'critical item')+'</span><span><span class="dot medium"></span>'+plural(nW,'risk')+'</span><span><span class="dot low"></span>'+nI+' to verify</span><span><span class="dot ok"></span>'+nOk+' passed</span></div>'+
+    '<div class="w25note">'+ic('info')+esc(cfg.note)+'</div></div>'+
+    '<div class="w25path"><b>Recommended path</b><ol>'+cfg.path.map(function(p){return '<li>'+esc(p)+'</li>';}).join('')+'</ol></div></div>';
+  h+='<div class="w25cols" style="grid-template-columns:repeat('+cfg.cats.length+',1fr)">'+cfg.cats.map(function(cat){var cs=list.filter(function(c){return c.cat===cat[0];}).sort(function(a,b){return order[a.sev]-order[b.sev];});
+    var cw=worstOf(cs.filter(function(c){return c.sev!=='ok';}).map(function(c){return c.sev;}));var cOk=cs.filter(function(c){return c.sev==='ok';}).length;
+    return '<div class="w25col"><div class="w25ch"><span class="w25ci '+(SEVMAP[cw]||'ok')+'">'+ic(cat[2])+'</span><div><b>'+cat[1]+'</b><span>'+cOk+' of '+cs.length+' passed</span></div></div>'+
+      (cs.length?cs.map(function(c){return '<div class="w25it" data-b="'+key+'" data-i="'+c.i+'"><span class="w25st '+SEVMAP[c.sev]+'">'+ic(c.sev==='ok'?'check':(c.sev==='crit'?'x':(c.sev==='warn'?'alert':'info')))+'</span><div class="w25b"><div class="w25n">'+esc(c.title)+'</div>'+(c.result?'<div class="w25r">'+esc(c.result)+'</div>':'')+'</div></div>';}).join(''):'<div class="w25r" style="padding:12px 16px">No checks in this category.</div>')+'</div>';}).join('')+'</div>';
+  h+='<div class="w25det" id="'+key+'det"></div>';
+  if(key==='w25'&&arr(W.notes).length)h+='<div class="banner-note" style="margin-top:14px;margin-bottom:0">'+ic('alert')+arr(W.notes).map(esc).join(' &middot; ')+'</div>';
+  el.innerHTML=h;
+  Array.prototype.forEach.call(el.querySelectorAll('.w25it'),function(it){it.onclick=function(){boardShow(key,+it.getAttribute('data-i'),true);};});
+  var first=list.slice().sort(function(a,b){return order[a.sev]-order[b.sev];})[0];if(first&&first.sev!=='ok')boardShow(key,first.i,false);
+}
+function boardShow(key,i,scroll){
+  var c=CHK[i],el=qs('#'+key);if(!c||!el)return;var det=qs('#'+key+'det');
+  if(BSEL[key]===i){BSEL[key]=-1;det.innerHTML='';Array.prototype.forEach.call(el.querySelectorAll('.w25it'),function(e){e.classList.remove('sel');});return;}
+  BSEL[key]=i;
+  Array.prototype.forEach.call(el.querySelectorAll('.w25it'),function(e){e.classList.toggle('sel',+e.getAttribute('data-i')===i);});
+  var st=c.sev==='ok'?tag('ok','Pass'):(c.sev==='crit'?tag('crit',key==='w25'?'Blocker':'Critical'):(c.sev==='warn'?tag('warn','Risk'):tag('info','Verify')));
+  det.innerHTML='<div class="w25dh">'+st+'<b>'+esc(c.title)+'</b><span>'+esc(c.result)+'</span><button class="mini-btn" onclick="boardShow(\''+key+'\','+i+')">'+ic('x')+'Close</button></div>'+
+    '<div class="w25db">'+(c.advice?'<div class="finding '+(c.sev==='crit'?'high':(c.sev==='warn'?'medium':'low'))+'">'+ic(c.sev==='info'?'info':'alert')+'<div><b>What to do</b>'+esc(c.advice)+'</div></div>':'<div class="no-findings">'+ic('check')+'Nothing to do for this check.</div>')+
+    (c.rows.length?'<div class="tbl-wrap" style="margin-top:14px;max-height:320px;border:1px solid var(--border);border-radius:var(--radius-sm)"><table class="tbl"><tr>'+c.cols.map(function(x){return '<th>'+x+'</th>';}).join('')+'</tr>'+c.rows.map(function(r){return '<tr>'+r.map(function(v,j){return '<td>'+(j===r.length-1&&(''+v).indexOf('<span')===0?v:esc(v))+'</td>';}).join('')+'</tr>';}).join('')+'</table></div>'+(c.note?'<div class="lnote" style="font-size:12px;color:var(--muted);margin-top:6px">'+esc(c.note)+'</div>':''):'')+
+    (c.src?'<a class="srclink" href="'+c.src.u+'" target="_blank" rel="noopener">'+ic('info')+'Microsoft source: '+esc(c.src.t)+' &rarr;</a>':'')+'</div>';
+  if(scroll&&det.getBoundingClientRect().top>window.innerHeight-120)det.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+renderBoard('w25');
+
+/* ---------------- time sync ---------------- */
+(function(){
+  var anyVm=DCS.some(function(dc){return dc.platform==='VMware';});
+  var rows=DCS.map(function(dc){var t=dc.time||{},f=arr(t.findings).slice().sort(function(a,b){return RANK[b.sev]-RANK[a.sev];});
+    var read=!!(t.type||t.source);
+    var st=!read?tag('','not read'):(f.length?f.map(function(x){return '<div class="tiss"><span class="dot '+SEVMAP[x.sev]+'"></span>'+esc(x.title)+'</div>';}).join(''):tag('ok','OK'));
+    var typ=esc(t.type||'-')+(t.cfgBy==='Group Policy'?' '+tag('info','GPO'):'');
+    var main='<tr class="trow" onclick="var d=this.nextElementSibling;var o=d.style.display===\'none\';d.style.display=o?\'\':\'none\';this.classList.toggle(\'open\',o);"><td style="white-space:nowrap"><b>'+esc(dc.short)+'</b>'+(dc.isPdc?' '+tag('info','PDC'):'')+'</td><td>'+esc(dc.platform||'Unknown')+'</td><td>'+typ+'</td><td class="mono">'+esc(t.source||t.error||'-')+'</td><td style="white-space:nowrap">'+esc(t.lastSync||'-')+'</td><td class="num">'+(t.offsetPdc==null||dc.isPdc?'':offTxt(t.offsetPdc))+'</td><td>'+st+'</td><td style="width:22px">'+CHEV+'</td></tr>';
+    var kv='<div class="kv-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:'+(f.length?'12px':'0')+'">'+
+      '<div class="kv"><div class="k">NTP server</div><div class="v mono" style="font-size:12px">'+esc(t.ntpServer||'-')+'</div></div>'+
+      '<div class="kv"><div class="k">Configured by</div><div class="v">'+esc(t.cfgBy||'-')+'</div></div>'+
+      '<div class="kv"><div class="k">Stratum</div><div class="v">'+esc(t.stratum||'-')+'</div></div>'+
+      '<div class="kv"><div class="k">Hardware / VM</div><div class="v" style="font-size:12.5px">'+esc(dc.model||dc.platform||'-')+'</div></div></div>';
+    var det='<tr class="tdet" style="display:none"><td colspan="8">'+kv+(f.length?'<div class="findings">'+f.map(function(x){return findingHtml({sec:'time',sev:x.sev,title:x.title,advice:x.advice,who:[]});}).join('')+'</div>':'')+'</td></tr>';
+    return main+det;}).join('');
+  var fl=FL.filter(function(f){return f.sec==='time';});
+  qs('#time').innerHTML=panel('clock','Domain controllers','The PDC emulator should sync from reliable external NTP; every other DC follows the domain hierarchy. Click a DC for details.','<div class="tbl-wrap"><table class="tbl"><tr><th>DC</th><th>Platform</th><th>Type</th><th>Current source</th><th>Last sync</th><th>Offset vs PDC</th><th>Issues</th><th></th></tr>'+rows+'</table></div>')+
+    (anyVm?'<div class="banner-note" style="margin-bottom:12px">'+ic('info')+'VMware domain controllers: make sure VMware Tools periodic time synchronization is turned off, so the host does not fight the Windows Time service.</div>':'')+
+    (fl.length?'':'<div class="no-findings">'+ic('check')+'Time hierarchy looks correct.</div>');
+})();
+
+/* ---------------- backup ---------------- */
+(function(){
+  var sv=BK.sysvol||{};
+  var kv='<div class="kv-grid" style="margin-bottom:20px">'+
+    '<div class="kv"><div class="k">AD Recycle Bin</div><div class="v '+(rbSev==='ok'?'good':(rbSev==='warn'?'warn':'mut'))+'">'+(BK.recycleBin===false?'Unknown':(BK.recycleBinEnabled?'Enabled':'Not enabled'))+'</div></div>'+
+    '<div class="kv"><div class="k">Tombstone lifetime</div><div class="v '+(TSL<180?'warn':'')+'">'+TSL+' days</div></div>'+
+    '<div class="kv"><div class="k">SYSVOL replication</div><div class="v '+(sv.sev==='ok'?'good':(sv.sev==='crit'?'bad':'warn'))+'">'+esc(sv.mode||'Unknown')+'</div></div>'+
+    '<div class="kv"><div class="k">SYSVOL state</div><div class="v">'+esc(sv.state||'-')+'</div></div></div>';
+  var parts=arr(BK.partitions);
+  var tb=panel('archive','Last backup per partition','Recommended: at least daily, and always well within the '+TSL+'-day tombstone lifetime',parts.length?'<div class="tbl-wrap"><table class="tbl"><tr><th>Partition</th><th>Last backup</th><th>Age</th><th>Status</th></tr>'+parts.map(function(p){var s=partSev(p);
+    return '<tr><td><b>'+esc(p.name)+'</b><div class="mono" style="color:var(--muted);font-size:11px">'+esc(p.dn)+'</div></td><td>'+(p.last?esc(p.last):(p.error?'<span style="color:var(--muted)">could not be read</span>':'Never'))+'</td><td class="num">'+(p.days==null?'-':p.days+' d')+'</td><td>'+tag(s,s==='ok'?'OK':(s==='info'?'Unknown':SEVWORD[s]))+'</td></tr>';}).join('')+'</table></div>':'<div class="panel-body"><div class="muted-note">Partition backup times could not be read.</div></div>');
+  var fl=FL.filter(function(f){return f.sec==='backup';});
+  qs('#backup').innerHTML=kv+tb+(fl.length?'':'<div class="no-findings">'+ic('check')+'Recovery readiness looks good.</div>');
+})();
+
+function csvSettings(){var rows=[['DC','Site','Role'].concat(SET.map(function(x){return x[1];}))];DCS.forEach(function(d){rows.push([d.name,d.site,roleTxt(d)].concat(SET.map(function(x){var s=dcSetting(d,x[0]);return s?s.value:'';})));});dl('auth_settings.csv',rows);}
+function csvAgg(key){var rows=[['Name','Count','Distinct','Details','DCs','Last']];arr(EV[key]).forEach(function(x){rows.push([x.name,x.count,x.distinct,arr(x.others).map(function(o){return o.name+' ('+o.count+')';}).join(' | '),arr(x.dcs).join(' | '),x.last]);});dl(key+'.csv',rows);}
+(function(){
+  function cnt(sec){var l=FL.filter(function(f){return f.sec===sec&&f.sev!=='info';});var w=worstOf(l.map(function(f){return f.sev;}));return l.length?'<span class="n '+SEVMAP[w]+'">'+l.length+'</span>':'';}
+  var S=[['overview','Overview','key',''],['w25','Server 2025 readiness','up',cnt('w25')],['proto','Protocols & hardening','shield',cnt('proto')],['events','Security events','journal',cnt('events')],['time','Time sync','clock',cnt('time')],['backup','Backup & recovery','archive',cnt('backup')]];
+  qs('#secnav').innerHTML=S.map(function(x){return '<a data-s="'+x[0]+'">'+ic(x[2])+'<span>'+esc(x[1])+'</span>'+x[3]+'</a>';}).join('');
+  Array.prototype.forEach.call(document.querySelectorAll('#secnav a'),function(a){a.onclick=function(){var s=a.getAttribute('data-s');if(s==='overview')window.scrollTo({top:0,behavior:'smooth'});else{var el=qs('#sec-'+s);if(el)el.scrollIntoView({behavior:'smooth',block:'start'});}};});
+  function spy(){var cur='overview';S.forEach(function(x){var el=qs('#sec-'+x[0]);if(el&&el.getBoundingClientRect().top<90)cur=x[0];});
+    if(window.innerHeight+window.scrollY>=document.body.scrollHeight-4)cur=S[S.length-1][0];
+    Array.prototype.forEach.call(document.querySelectorAll('#secnav a'),function(a){a.classList.toggle('on',a.getAttribute('data-s')===cur);});}
+  window.addEventListener('scroll',spy,{passive:true});spy();
+})();
+paintIcons();
+</script>
+</body></html>
+"@
+
+$stage = 'write-file'
+Write-Host "Writing file..." -ForegroundColor Yellow
+try {
+    [System.IO.File]::WriteAllText($ReportPath, $HTML, [System.Text.UTF8Encoding]::new($true))
+} catch {
+    Write-Host ""
+    Write-Host ">>> FAILED at stage '$stage': $($_.Exception.GetType().Name) - $($_.Exception.Message)" -ForegroundColor Red
+    throw
+}
+Write-Host ""
+Write-Host "  Report saved: $ReportPath" -ForegroundColor Green
+try { if ($OpenReport) { Start-Process $ReportPath } } catch {}
