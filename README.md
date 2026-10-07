@@ -231,7 +231,7 @@ These nine modules are part of an ongoing Active Directory Audit Suite. Addition
 
 Watch or ⭐ the repo to catch new modules as they land.
 
-For more detail on the project direction, see [docs/ROADMAP.md](docs/ROADMAP.md).
+For more detail on the project direction, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
