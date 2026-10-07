@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     AD Domain Controller Inventory & Specifications - interactive HTML dashboard.
 
@@ -95,7 +95,17 @@ function Get-OSShortName {
 }
 function Test-DCOnline {
     param([string]$name)
-    try { return (Test-Connection -ComputerName $name -Count 1 -Quiet -ErrorAction SilentlyContinue) } catch { return $false }
+    # ICMP is often blocked on domain controllers, so a missing ping reply alone does not mean offline.
+    try { if (Test-Connection -ComputerName $name -Count 1 -Quiet -ErrorAction SilentlyContinue) { return $true } } catch {}
+    foreach ($port in @(389, 88, 135, 445, 9389)) {
+        $tcp = $null
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $iar = $tcp.BeginConnect($name, $port, $null, $null)
+            if ($iar.AsyncWaitHandle.WaitOne(1500, $false) -and $tcp.Connected) { $tcp.EndConnect($iar); return $true }
+        } catch {} finally { if ($tcp) { $tcp.Close() } }
+    }
+    return $false
 }
 # Open a CIM session over WinRM if possible, else fall back to DCOM. Returns @{ session; via } or $null.
 function New-DCSession {
@@ -426,8 +436,8 @@ function renderKpis(){
   function kpi(num,lbl,ico,cls){ return '<div class="kpi '+(cls||'')+'"><div class="chip"><i class="bi '+ico+'"></i></div><div><div class="num">'+num+'</div><div class="lbl">'+lbl+'</div></div></div>'; }
   document.getElementById('kpis').innerHTML=
     kpi(D.totalDCs||0,'Domain Controllers','bi-hdd-rack')
-    + kpi(D.onlineDCs||0,'Online','bi-check-circle','good')
-    + kpi(D.offlineDCs||0,'Offline','bi-x-circle',((D.offlineDCs||0)>0?'bad':''))
+    + kpi(D.onlineDCs||0,'Reachable','bi-check-circle','good')
+    + kpi(D.offlineDCs||0,'Unreachable','bi-x-circle',((D.offlineDCs||0)>0?'bad':''))
     + kpi(D.domainCount||0,'Domains','bi-diagram-3')
     + kpi(D.siteCount||0,'Sites','bi-geo-alt','teal')
     + kpi(D.gcCount||0,'Global Catalogs','bi-globe','purple')
@@ -451,7 +461,7 @@ function renderTable(){
       +'<td class="mono">'+(isNA(d.uptime)?'&mdash;':esc(d.uptime))+'</td>'
       +'<td>'+(d.isGC?'<span class="badge yes">Yes</span>':'<span class="badge no">No</span>')+'</td>'
       +'<td>'+(d.isRODC?'<span class="badge warn">Yes</span>':'<span class="badge no">No</span>')+'</td>'
-      +'<td>'+(d.online?'<span class="badge on"><i class="bi bi-circle-fill" style="font-size:7px"></i> Online</span>':'<span class="badge off"><i class="bi bi-circle-fill" style="font-size:7px"></i> Offline</span>')+'</td>'
+      +'<td>'+(d.online?'<span class="badge on"><i class="bi bi-circle-fill" style="font-size:7px"></i> Reachable</span>':'<span class="badge off"><i class="bi bi-circle-fill" style="font-size:7px"></i> Unreachable</span>')+'</td>'
       +'</tr>';
   });
   h+='</tbody>';
@@ -461,7 +471,7 @@ function renderTable(){
 function usageBar(pct){ const cls = pct>=90?'bad':pct>=75?'warn':''; return '<div class="usebar"><div class="usefill '+cls+'" style="width:'+Math.min(100,Math.max(0,pct))+'%"></div></div>'; }
 
 function specBody(d){
-  if(!d.online){ return '<div class="unavail"><i class="bi bi-exclamation-circle"></i> This domain controller was offline/unreachable &mdash; hardware and performance data could not be collected.</div>'; }
+  if(!d.online){ return '<div class="unavail"><i class="bi bi-exclamation-circle"></i> This domain controller did not respond from the audit host (it may be running but blocked by a firewall or network path) &mdash; hardware and performance data could not be collected.</div>'; }
   if(!D.hardwareCollected){ return '<div class="unavail">Hardware/performance collection was skipped.</div>'; }
   const hw=d.hardware||{}; const pf=d.performance||{};
   let h='<div class="spec-grid">';

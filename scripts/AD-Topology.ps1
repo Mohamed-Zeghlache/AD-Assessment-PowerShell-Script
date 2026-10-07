@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     AD Infrastructure Topology - interactive, self-contained HTML viewer.
 
@@ -92,9 +92,22 @@ function Get-DCLiveHealth {
     $short = $HostName.Split('.')[0]
     $isLocal = ($short -ieq $LocalName)
 
-    # Ping
-    if (Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction SilentlyContinue) { $r.status='Online' }
-    else { $r.status='Offline'; return $r }
+    # Reachability: ping, or any core DC port (ICMP is often blocked on domain controllers)
+    $alive = $false
+    try { if (Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction SilentlyContinue) { $alive = $true } } catch {}
+    if (-not $alive) {
+        foreach ($port in @(389, 88, 135, 445, 9389)) {
+            $tcp = $null
+            try {
+                $tcp = New-Object System.Net.Sockets.TcpClient
+                $iar = $tcp.BeginConnect($HostName, $port, $null, $null)
+                if ($iar.AsyncWaitHandle.WaitOne(1500, $false) -and $tcp.Connected) { $tcp.EndConnect($iar); $alive = $true }
+            } catch {} finally { if ($tcp) { $tcp.Close() } }
+            if ($alive) { break }
+        }
+    }
+    if ($alive) { $r.status='Online' }
+    else { $r.status='Unreachable'; return $r }
 
     # CIM session: WinRM then DCOM
     $cim=$null; $proto='None'
@@ -898,7 +911,7 @@ table.pt tbody tr:last-child td{border-bottom:none}
   <div class="search"><i class="bi bi-search"></i><input id="srch" type="text" placeholder="Search DC or site&hellip;" oninput="doSearch(this.value)"></div>
   <div class="bgrp" id="fltBtns">
     <button class="btn" id="f-fsmo"    onclick="flt('fsmo')">   <i class="bi bi-star-fill"></i> FSMO</button>
-    <button class="btn" id="f-offline" onclick="flt('offline')"><i class="bi bi-x-circle"></i> Offline</button>
+    <button class="btn" id="f-offline" onclick="flt('offline')"><i class="bi bi-x-circle"></i> Unreachable</button>
     <button class="btn" id="f-gc"      onclick="flt('gc')">     <i class="bi bi-globe"></i> GC</button>
     <button class="btn" id="f-repl"    onclick="flt('repl')">   <i class="bi bi-arrow-repeat"></i> Repl issues</button>
   </div>
@@ -930,7 +943,7 @@ table.pt tbody tr:last-child td{border-bottom:none}
   <div class="li"><div class="lsq" style="background:var(--site-c)"></div>Site</div>
   <div class="li"><div class="ld" style="background:var(--blue)"></div>GC</div>
   <div class="li"><div class="ld" style="background:#4b5563"></div>DC</div>
-  <div class="li"><div class="ld" style="background:var(--red)"></div>Offline</div>
+  <div class="li"><div class="ld" style="background:var(--red)"></div>Unreachable</div>
   <div class="li"><div class="ld" style="background:var(--green)"></div>Healthy</div>
   <div class="li"><div class="ld" style="background:var(--yellow)"></div>Warning &nbsp;<small>(&#10227; dot = pending reboot)</small></div>
   <div class="li"><div class="ld" style="background:var(--red)"></div>Critical &nbsp;<small>(&#9679; dot = NTLMv1)</small></div>
@@ -1128,7 +1141,7 @@ function openPanel(n){
   }
   function isBad(v){ const s=norm(v); return s===null; } // unavailable
   const st=dc.status==='Online'
-    ?'<span style="color:var(--green)"><i class="bi bi-check-circle-fill"></i> Online</span>'
+    ?'<span style="color:var(--green)"><i class="bi bi-check-circle-fill"></i> Reachable</span>'
     :'<span style="color:var(--red)"><i class="bi bi-x-circle-fill"></i> '+dc.status+'</span>';
   // kv: shows '&mdash;' (muted) when value is unavailable instead of the raw 'Error' text
   function kv(k,v,c=''){

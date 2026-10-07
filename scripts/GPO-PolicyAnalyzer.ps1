@@ -1021,6 +1021,41 @@ foreach ($wk in $WellKnownGpos) {
     }
 }
 
+# WMI filters: a GPO with a WMI filter only applies to computers where its WQL query is true,
+# so two GPOs that look like they conflict may never apply to the same computer.
+$GpoWmiForJson = @{}
+try {
+    $domDN = $null; try { $domDN = (Get-ADDomain -ErrorAction Stop).DistinguishedName } catch {}
+    if ($domDN) {
+        $WmiById = @{}
+        try {
+            $wmiObjs = @(Get-ADObject -SearchBase ("CN=SOM,CN=WMIPolicy,CN=System," + $domDN) -LDAPFilter '(objectClass=msWMI-Som)' -Properties 'msWMI-Name','msWMI-Parm1','msWMI-Parm2','msWMI-ID' -ErrorAction Stop)
+            foreach ($w in $wmiObjs) {
+                $raw = [string]$w.'msWMI-Parm2'; $queries = @()
+                $tok = $raw -split ';'
+                for ($t = 0; $t -lt $tok.Count - 2; $t++) {
+                    if ($tok[$t] -eq 'WQL') { $queries += ($tok[$t + 2]).Trim(); $t += 2 }
+                }
+                $wid = ([string]$w.'msWMI-ID').ToLowerInvariant().Trim('{','}')
+                if ($wid) { $WmiById[$wid] = @{ name = [string]$w.'msWMI-Name'; description = [string]$w.'msWMI-Parm1'; query = ($queries -join '  |  ') } }
+            }
+        } catch {}
+        foreach ($m in $Manifest) {
+            try {
+                $gid = ([string]$m.Id).Trim('{','}')
+                $gad = Get-ADObject -Identity ("CN={" + $gid + "},CN=Policies,CN=System," + $domDN) -Properties gPCWQLFilter -ErrorAction Stop
+                $f = [string]$gad.gPCWQLFilter
+                if ($f -match '\{([0-9a-fA-F-]{36})\}') {
+                    $wid = $Matches[1].ToLowerInvariant()
+                    if ($WmiById.ContainsKey($wid)) { $GpoWmiForJson[[string]$m.Name] = $WmiById[$wid] }
+                    else { $GpoWmiForJson[[string]$m.Name] = @{ name = 'WMI filter ' + $wid; description = ''; query = '' } }
+                }
+            } catch {}
+        }
+    }
+} catch {}
+if ($GpoWmiForJson.Count) { Write-Host "      $($GpoWmiForJson.Count) GPO(s) use a WMI filter" -ForegroundColor DarkGray }
+
 $Summary = [ordered]@{
     domain              = $DomainDNS
     generatedAt         = $GeneratedAt
@@ -1043,6 +1078,7 @@ $Summary = [ordered]@{
     baseline            = [ordered]@{ name='Starter hardening baseline'; total=$Baseline.Count; compliant=$bl_comp; wrong=$bl_wrong; missing=$bl_miss; results=@($BaselineResults) }
     builtinHealth       = @($BuiltinHealth)
     integrity           = $GpoIntegrity
+    gpoWmi              = $GpoWmiForJson
 }
 $DataJSON = ConvertTo-Json -InputObject $Summary -Depth 10 -Compress
 Write-Host "[5/5] Rendering HTML..." -ForegroundColor Cyan
@@ -1518,6 +1554,18 @@ D.conflictCount = ROWS.filter(function(r){return r._cls==='conflict';}).length;
 var REDUNDANT_COUNT = ROWS.filter(function(r){return r._cls==='redundant';}).length;
 var DIFFERS_COUNT = ROWS.filter(function(r){return r._cls==='differs';}).length;
 var ADDITIVE_COUNT = ROWS.filter(function(r){return r._cls==='additive';}).length;
+var WMI = (D.gpoWmi && typeof D.gpoWmi==='object' && !Array.isArray(D.gpoWmi)) ? D.gpoWmi : {};
+function wmiOf(g){ var w=WMI[g]; return (w && w.name) ? w : null; }
+function wmiGposOf(r){ var av=r.values||{}; return Object.keys(av).filter(function(g){ return av[g]!=null && (''+av[g]).trim()!=='' && wmiOf(g); }); }
+function wmiTip(r){ return (r._wmi||[]).map(function(g){ var w=wmiOf(g); return g+' \u2192 '+w.name+(w.query?' ('+w.query+')':''); }).join('  |  '); }
+function wmiBadge(r){ return (r._wmi&&r._wmi.length)?' <span class="wmi-b" title="'+escapeHtml('WMI filter on: '+wmiTip(r)+'. A WMI-filtered GPO only applies where its query is true, so check whether the filtered computers really overlap before treating this as a conflict.')+'"><i class="bi bi-funnel-fill"></i> WMI</span>':''; }
+ROWS.forEach(function(r){
+  r._wmi = (r._cls==='conflict'||r._cls==='differs') ? wmiGposOf(r) : [];
+  if(r._wmi.length) r._clsLabel += ' Note: '+r._wmi.length+' of these GPOs '+(r._wmi.length===1?'has':'have')+' a WMI filter ('+r._wmi.map(function(g){return g+': '+wmiOf(g).name;}).join('; ')+'). They only apply where the filter matches, so verify the conflict is real.';
+});
+var WMI_CONFLICT_COUNT = ROWS.filter(function(r){return r._cls==='conflict' && r._wmi.length;}).length;
+var WMI_GPO_COUNT = GPOS_ALL_WMI();
+function GPOS_ALL_WMI(){ return Object.keys(WMI).filter(function(g){return wmiOf(g);}).length; }
 function clsTag(r){
   if(r._cls==='conflict') return '<span class="cf-mark" title="Real conflict \u2014 GPOs share an OU branch">&#9888;</span> ';
   if(r._cls==='redundant') return '<span class="cls-tag redu" title="'+escapeHtml(r._clsLabel)+'">redundant</span> ';
@@ -1531,6 +1579,7 @@ function clsVerdict(r){
   var x=m[r._cls]; return '<div class="verdict '+x[0]+'"><span class="vb-ic">'+x[1]+'</span><div><b>'+x[2]+'</b><div class="vb-sub">'+escapeHtml(r._clsLabel)+'</div></div></div>';
 }
 var CLS_HELP={
+ wmi:'Conflicts where at least one GPO has a WMI filter. A WMI-filtered GPO only applies to computers matching its query (for example a specific OS or hardware), so the two values may never reach the same computer. Check the filter before changing anything.',
  conflict:'Two or more GPOs set this exact setting to DIFFERENT values, and their links overlap on the same OU branch - so a machine in that branch receives both. Precedence picks one winner; the other value is discarded. This is the only class that is a genuine problem.',
  redundant:'Two or more GPOs set this setting to the SAME value. Harmless duplication if they overlap, or the same value repeated across separate OU subtrees (worth consolidating to reduce sprawl).',
  differs:'GPOs set DIFFERENT values but are linked to separate OU subtrees, so no single object ever receives both. Not a real conflict - each subtree just gets its own value.',
@@ -1548,7 +1597,7 @@ function renderClsSummary(){ var el=document.getElementById('clsSummary'); if(!e
   var h=document.getElementById('clsHelp'); if(h){
     function row(c,name,cls){ return '<div class="ch-row"><span class="cs-b '+cls+'" style="cursor:default">'+name+'</span><span class="ch-txt">'+CLS_HELP[c]+'</span></div>'; }
     h.innerHTML=row('conflict','conflict','conflict')+row('redundant','redundant','redu')+row('differs','separate scopes','diff')+row('additive','additive','addi')
-      +'<div class="ch-note">Classification is by OU linking and setting type only - security-group and WMI filtering are not evaluated, so confirm borderline cases with the OU tree in a setting\u2019s detail pane.</div>';
+      +'<div class="ch-note">Classification is by OU linking and setting type only - security-group and WMI filtering are not evaluated. When a GPO involved in a conflict has a WMI filter, open the setting: its detail pane shows the filter and query so you can check whether the GPOs really apply to the same computers.</div>';
   }
 }
 const GPOS = Array.isArray(D.gpoNames) ? D.gpoNames : [];
@@ -2007,6 +2056,8 @@ function openDetail(idx){
         const tip = (h.issues||[]).join('; ');
         flag = ' <i class="bi bi-exclamation-triangle-fill" style="color:var(--amber);font-size:9px" title="'+escapeHtml(tip)+'"></i>';
       }
+      const wf = wmiOf(g);
+      if(wf){ flag += ' <i class="bi bi-funnel-fill wmi-ic" title="'+escapeHtml('WMI filter: '+wf.name+(wf.query?' ('+wf.query+')':''))+'"></i>'; }
       if(r.conflict && r.winner && g===r.winner){
         flag += ' <i class="bi bi-trophy-fill" style="color:var(--green);font-size:9px" title="Winning value (highest precedence)"></i>';
       }
@@ -2042,6 +2093,8 @@ function openDetail(idx){
       clsVerdict(r)
     + '<div class="psec"><div class="psec-t"><i class="bi '+scopeIcon+'"></i> Setting Details</div>'+metaHtml+'</div>'
     + conflictHtml
+    + ((r._wmi&&r._wmi.length) ? '<div class="psec"><div class="psec-t"><i class="bi bi-funnel-fill" style="color:#7c3aed"></i> WMI filters</div><div style="font-size:11px;color:var(--muted);line-height:1.6;margin-bottom:8px">These GPOs only apply to computers where their WMI query is true. If the queries target different computers (for example different OS versions), the values never collide and this is not a real conflict.</div>'
+        + r._wmi.map(function(g){ var w=wmiOf(g); return '<div class="valrow"><span class="vn">'+escapeHtml(g)+'</span><span class="vv"><b>'+escapeHtml(w.name)+'</b>'+(w.description?'<br><span style="color:var(--muted)">'+escapeHtml(w.description)+'</span>':'')+(w.query?'<br><code style="font-size:10.5px">'+escapeHtml(w.query)+'</code>':'')+'</span></div>'; }).join('') + '</div>' : '')
     + buildLinkPrec(r)
     + buildOuTree(r);
   document.getElementById('ov').classList.add('on');

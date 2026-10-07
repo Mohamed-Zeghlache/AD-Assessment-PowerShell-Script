@@ -87,7 +87,7 @@ function Get-AgeDays { param($dt)
     try { return [int]([math]::Round(($script:Now - $dt).TotalDays)) } catch { return $null }
 }
 function Get-EncAssessment { param($val)
-    if ($null -eq $val -or "$val" -eq '') { return @{ Label='Not set (default RC4)'; Class='warn' } }
+    if ($null -eq $val -or "$val" -eq '') { return @{ Label='Not set (DC default)'; Class='ok' } }
     $n = 0; try { $n = [int]$val } catch { return @{ Label="$val"; Class='warn' } }
     $des = ($n -band 0x1) -or ($n -band 0x2)
     $rc4 = ($n -band 0x4)
@@ -287,11 +287,17 @@ Write-Host "      $ld_total delegated grant(s); $ld_susp suspicious, $ld_excess 
 Write-Host "[6/8] Scanning user accounts for credential risks..." -ForegroundColor Yellow
 $uprops = 'ServicePrincipalNames','PasswordNeverExpires','PasswordNotRequired','pwdLastSet','lastLogonTimestamp',
           'msDS-SupportedEncryptionTypes','adminCount','TrustedForDelegation','SIDHistory','Enabled'
-$Accounts=@(); $c_spn=0;$c_never=0;$c_notreq=0;$c_deleg=0;$c_sidhist=0;$c_inactive=0;$c_stalesvc=0;$c_priv=0
+# AES keys exist only for passwords set after the domain first supported AES (the "Read-only Domain Controllers"
+# group, RID 521, is created at that point). Accounts whose password is older have no AES keys.
+$AesSince=$null
+try { $rodcGrp=Get-ADGroup -Identity ("$($Domain.DomainSID.Value)-521") -Properties whenCreated -ErrorAction Stop; $AesSince=[datetime]$rodcGrp.whenCreated } catch {}
+$Accounts=@(); $c_spn=0;$c_never=0;$c_notreq=0;$c_deleg=0;$c_sidhist=0;$c_inactive=0;$c_stalesvc=0;$c_priv=0;$c_noaes=0;$c_noaessvc=0
 try {
     foreach ($u in (Get-ADUser -Filter * -Properties $uprops -ErrorAction Stop)) {
         $spns=@($u.ServicePrincipalNames); $isSvc=$spns.Count -gt 0
-        $pAge=Get-AgeDays (ConvertFrom-FileTimeSafe $u.pwdLastSet)
+        $pSet=ConvertFrom-FileTimeSafe $u.pwdLastSet
+        $pAge=Get-AgeDays $pSet
+        $fNoAes=([bool]$u.Enabled -and $null -ne $AesSince -and $null -ne $pSet -and ($pSet -lt $AesSince) -and "$($u.SamAccountName)" -ne 'krbtgt')
         $ll=ConvertFrom-FileTimeSafe $u.lastLogonTimestamp
         $enc=Get-EncAssessment $u.'msDS-SupportedEncryptionTypes'
         $priv=([int]($u.adminCount) -ge 1)
@@ -309,17 +315,18 @@ try {
         if($fSidHist){$findings+='SID history present';$c_sidhist++}
         if($fInactive){$findings+="Enabled but inactive ($llAge days)";$c_inactive++}
         if($fStale){$findings+="Service-account password $pAge days old";$c_stalesvc++}
+        if($fNoAes){$findings+='No AES keys (password set before AES support)';$c_noaes++; if($isSvc){$c_noaessvc++}}
         if($isSvc){$c_spn++}
         if($priv){$c_priv++}
         if($findings.Count -gt 0 -or $isSvc -or $priv){
             $sev='low'
-            if($fNotReq -or $fDeleg -or $fSidHist){$sev='high'}
+            if($fNotReq -or $fDeleg -or $fSidHist -or ($fNoAes -and $isSvc)){$sev='high'}
             elseif($findings.Count -gt 0){$sev='medium'}
             $Accounts += [PSCustomObject]@{
                 name="$($u.SamAccountName)"; enabled=[bool]$u.Enabled; isService=$isSvc; privileged=$priv
                 spnCount=$spns.Count; pwdAgeDays=$pAge; lastLogon=$(if($ll){$ll.ToString('yyyy-MM-dd')}else{'never / unknown'})
                 enc=$enc.Label; encClass=$enc.Class; severity=$sev; findings=@($findings)
-                flags=[ordered]@{ neverExpires=$fNever; notRequired=$fNotReq; deleg=$fDeleg; sidHist=$fSidHist; inactive=$fInactive; staleSvc=$fStale }
+                flags=[ordered]@{ neverExpires=$fNever; notRequired=$fNotReq; deleg=$fDeleg; sidHist=$fSidHist; inactive=$fInactive; staleSvc=$fStale; noAes=$fNoAes }
             }
         }
     }
@@ -327,8 +334,12 @@ try {
 } catch { Write-Host "      Account scan failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
 Write-Host "      $($Accounts.Count) account(s) of interest; SPN:$c_spn neverExp:$c_never notReq:$c_notreq deleg:$c_deleg sidHist:$c_sidhist inactive:$c_inactive staleSvc:$c_stalesvc" -ForegroundColor Green
 
-$KrbtgtAge=$null
-try { $k=Get-ADUser 'krbtgt' -Properties pwdLastSet -ErrorAction Stop; $KrbtgtAge=Get-AgeDays (ConvertFrom-FileTimeSafe $k.pwdLastSet) } catch {}
+$KrbtgtAge=$null; $KrbtgtNoAes=$false
+try {
+    $k=Get-ADUser 'krbtgt' -Properties pwdLastSet -ErrorAction Stop; $kSet=ConvertFrom-FileTimeSafe $k.pwdLastSet; $KrbtgtAge=Get-AgeDays $kSet
+    if ($null -ne $AesSince -and $null -ne $kSet -and $kSet -lt $AesSince) { $KrbtgtNoAes=$true }
+} catch {}
+if ($c_noaes -gt 0 -or $KrbtgtNoAes) { Write-Host "      AES keys: $c_noaes account(s) without AES keys ($c_noaessvc service)$(if($KrbtgtNoAes){'; krbtgt has no AES keys'})" -ForegroundColor DarkYellow }
 
 # ---------------------------------------------------------------------------
 # 6. Computer accounts
@@ -444,13 +455,13 @@ $Summary = [ordered]@{
     msas=@($MsaData); msaCount=@($MsaData).Count; gmsaCount=$gmsaCount; kdsPresent=$KdsPresent
     laps=[ordered]@{ mode=$LapsMode; total=$LapsTotal; covered=$LapsCovered; expired=$LapsExpired; missing=$LapsMissing; pct=$LapsPct; missingList=@($LapsMissingList) }
     accounts=@($Accounts)
-    counts=[ordered]@{ spn=$c_spn; privileged=$c_priv; neverExpires=$c_never; notRequired=$c_notreq; deleg=$c_deleg; sidHist=$c_sidhist; inactive=$c_inactive; staleSvc=$c_stalesvc }
+    counts=[ordered]@{ spn=$c_spn; privileged=$c_priv; neverExpires=$c_never; notRequired=$c_notreq; deleg=$c_deleg; sidHist=$c_sidhist; inactive=$c_inactive; staleSvc=$c_stalesvc; noAes=$c_noaes; noAesSvc=$c_noaessvc }
     computers=@($Computers); computerTotal=$CompTotal
     compCounts=[ordered]@{ stale=$cc_stale; oldPwd=$cc_oldpwd; legacyOS=$cc_legacy; deleg=$cc_deleg; disabled=$cc_disabled }
     lapsDeleg=@($LapsDeleg); lapsDelegRan=[bool]$LapsDelegRan; ldCounts=[ordered]@{ total=$ld_total; suspicious=$ld_susp; excessive=$ld_excess }
     fsps=@($Fsps); fspCount=@($Fsps).Count; fspCounts=[ordered]@{ orphaned=$fsp_orphaned; privileged=$fsp_priv }
     orphanSids=[ordered]@{ ran=[bool]$OrphanRan; scanned=$orphanScanned; objects=$orphanObjWith; distinct=$OrphanSids.Count; aces=$orphanAces; list=@($OrphanList) }
-    krbtgtAge=$KrbtgtAge; staleDays=$ServiceAccountStalePasswordDays; staleComputerDays=$StaleComputerDays
+    krbtgtAge=$KrbtgtAge; krbtgtNoAes=[bool]$KrbtgtNoAes; aesSince=$(if($AesSince){$AesSince.ToString('yyyy-MM-dd')}else{''}); staleDays=$ServiceAccountStalePasswordDays; staleComputerDays=$StaleComputerDays
 }
 $DataJSON = ConvertTo-Json -InputObject $Summary -Depth 12 -Compress
 
@@ -821,7 +832,7 @@ function donut(pct,label,color){
 }
 function renderDashboard(){
   const c=D.counts||{}, laps=D.laps||{};
-  const rows=[{l:'Never expires',v:c.neverExpires||0,c:'var(--amber)'},{l:'Password not required',v:c.notRequired||0,c:'var(--red)'},{l:'Unconstrained delegation',v:c.deleg||0,c:'var(--red)'},{l:'SID history',v:c.sidHist||0,c:'var(--red)'},{l:'Inactive but enabled',v:c.inactive||0,c:'var(--amber)'},{l:'Stale svc password',v:c.staleSvc||0,c:'var(--amber)'}];
+  const rows=[{l:'Never expires',v:c.neverExpires||0,c:'var(--amber)'},{l:'Password not required',v:c.notRequired||0,c:'var(--red)'},{l:'Unconstrained delegation',v:c.deleg||0,c:'var(--red)'},{l:'SID history',v:c.sidHist||0,c:'var(--red)'},{l:'Inactive but enabled',v:c.inactive||0,c:'var(--amber)'},{l:'Stale svc password',v:c.staleSvc||0,c:'var(--amber)'},{l:'No AES keys',v:c.noAes||0,c:'var(--red)'}];
   let h='<div class="chart-card col-8"><h3><i class="bi bi-exclamation-triangle"></i> User credential risk flags</h3>'+hbar(rows)+'</div>';
   const hasLaps=laps.mode&&laps.mode!=='None';
   h+='<div class="chart-card col-4"><h3><i class="bi bi-pc-display"></i> LAPS ('+esc(laps.mode||'None')+')</h3>'
@@ -894,6 +905,7 @@ function renderKrb(){
       ? '<div class="hint warn"><i class="bi bi-exclamation-triangle"></i><div><b>krbtgt password is '+age+' days old.</b> This key signs every Kerberos ticket, so a leaked hash enables Golden Ticket forgery. Rotate it <b>twice</b>, at least one replication cycle (10+ hours) apart, to fully invalidate old KRBTGT material - never both resets back-to-back.</div></div>'
       : '<div class="hint info"><i class="bi bi-info-circle"></i><div>krbtgt age is within a reasonable window. Rotate it periodically (twice, spaced by a replication cycle) as part of routine hygiene and after any suspected DC compromise.</div></div>';
   }
+  if(D.krbtgtNoAes){ card+='<div class="hint warn" style="margin-top:10px"><i class="bi bi-key"></i><div><b>krbtgt has no AES keys.</b> Its password was last set before the domain supported AES. Since the Kerberos hardening for CVE-2026-20833, domain controllers issue AES-only tickets by default, so reset the krbtgt password twice (one replication cycle apart) to create AES keys. <a href="https://support.microsoft.com/topic/1ebcda33-720a-4da8-93c1-b0496e1910dc" target="_blank" rel="noopener">Microsoft source</a></div></div>'; }
   document.getElementById('krbSection').innerHTML=card;
 }
 
@@ -902,6 +914,7 @@ const ACC_CATS=[
   {key:'notRequired',label:'Password not required',ico:'bi-shield-slash',sev:'high',pred:a=>a.flags.notRequired},
   {key:'deleg',label:'Unconstrained delegation',ico:'bi-diagram-3',sev:'high',pred:a=>a.flags.deleg},
   {key:'sidHist',label:'SID history present',ico:'bi-layers',sev:'high',pred:a=>a.flags.sidHist},
+  {key:'noAes',label:'No AES keys',ico:'bi-key',sev:'high',pred:a=>a.flags&&a.flags.noAes},
   {key:'inactive',label:'Inactive but enabled',ico:'bi-person-dash',sev:'medium',pred:a=>a.flags.inactive},
   {key:'never',label:'Password never expires',ico:'bi-clock-history',sev:'medium',pred:a=>a.flags.neverExpires},
   {key:'staleSvc',label:'Stale service password',ico:'bi-hourglass-split',sev:'medium',pred:a=>a.flags.staleSvc},
@@ -913,7 +926,7 @@ const ACC_HDR=['Name','Enabled','Service','Privileged','SPNs','PwdAgeDays','Last
 function csvAcc(key){ const cat=ACC_CATS.find(x=>x.key===key); downloadCsv('accounts_'+key+'.csv',ACC_HDR,acctRows(cat.pred)); }
 function openAcc(key){ const cat=ACC_CATS.find(x=>x.key===key); openReport(cat.label,(D.domain||''),ACC_HDR,acctRows(cat.pred)); }
 function renderAcctCats(){
-  document.getElementById('acctHint').innerHTML='<div class="hint info"><i class="bi bi-info-circle"></i><div><b>SPN-bearing accounts are Kerberoastable.</b> An attacker can request their service ticket and crack it offline, so ensure long/complex passwords, enable AES, and migrate to gMSA where possible. Large categories are kept behind Open / CSV to keep this page fast.</div></div>';
+  document.getElementById('acctHint').innerHTML='<div class="hint info"><i class="bi bi-info-circle"></i><div><b>SPN-bearing accounts are Kerberoastable.</b> An attacker can request their service ticket and crack it offline, so ensure long/complex passwords, enable AES, and migrate to gMSA where possible. Large categories are kept behind Open / CSV to keep this page fast.</div></div>'+((D.counts&&D.counts.noAes)?'<div class="hint warn"><i class="bi bi-key"></i><div><b>'+D.counts.noAes+' account(s) have no AES keys'+(D.counts.noAesSvc?' ('+D.counts.noAesSvc+' service accounts)':'')+'.</b> Their password was set before the domain supported AES'+(D.aesSince?' ('+esc(D.aesSince)+')':'')+'. Since the Kerberos hardening for CVE-2026-20833, domain controllers issue AES-only tickets by default, so service accounts without AES keys fail. Reset these passwords (coordinate with application owners) or move services to gMSA. Detection compares the password date with when the domain first supported AES, a common technique rather than a Microsoft tool. <a href="https://support.microsoft.com/topic/1ebcda33-720a-4da8-93c1-b0496e1910dc" target="_blank" rel="noopener">Microsoft source</a></div></div>':'');
   document.getElementById('acctCats').innerHTML=ACC_CATS.map(cat=>{
     const n=ACC.filter(cat.pred).length;
     const dis=n?'':' dis';

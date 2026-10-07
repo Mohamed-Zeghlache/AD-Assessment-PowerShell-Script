@@ -109,7 +109,10 @@ function Get-WorstSev {
 # Quick reachability gate so live tests never hang on a dead DC.
 function Test-Reachable {
     param([string]$Name)
-    try { return [bool](Test-Connection -ComputerName $Name -Count 1 -Quiet -ErrorAction SilentlyContinue) } catch { return $false }
+    # Ping first; ICMP is often blocked on domain controllers, so fall back to DNS / core DC ports.
+    try { if (Test-Connection -ComputerName $Name -Count 1 -Quiet -ErrorAction SilentlyContinue) { return $true } } catch {}
+    foreach ($p in @(53, 389, 88, 135, 445)) { if (Test-Port -ComputerName $Name -Port $p -TimeoutMs 1500) { return $true } }
+    return $false
 }
 
 # Fast TCP port probe with a hard timeout - used to avoid multi-minute WinRM/DCOM hangs.

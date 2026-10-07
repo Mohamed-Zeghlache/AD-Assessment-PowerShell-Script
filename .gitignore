@@ -10,3 +10,8 @@ Thumbs.db
 *.bak
 .vscode/
 .idea/
+# real assessment outputs - never publish
+AD_AuditSuite_run_*/
+AD_*_20*.html
+GPOBackups/
+*.log
