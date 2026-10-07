@@ -31,9 +31,9 @@
 .PARAMETER OpenReport
     Open the report when finished (default: $true).
 .EXAMPLE
-    .\AD-TrustRelationships-Enhanced.ps1
+    .\AD-TrustRelationships.ps1
 .EXAMPLE
-    .\AD-TrustRelationships-Enhanced.ps1 -OutputPath C:\Reports -TestConnectivity:$false
+    .\AD-TrustRelationships.ps1 -OutputPath C:\Reports -TestConnectivity:$false
 .NOTES
     Author  : Mohamed ZEGHLACHE
     Project : Active Directory Audit Suite (Trust Relationships module)

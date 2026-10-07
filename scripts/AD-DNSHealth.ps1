@@ -43,10 +43,10 @@
     Open the report when finished (default: $true).
 
 .EXAMPLE
-    .\AD-DNSHealth-Enhanced.ps1
+    .\AD-DNSHealth.ps1
 
 .EXAMPLE
-    .\AD-DNSHealth-Enhanced.ps1 -OutputPath C:\Reports -SkipLiveTests
+    .\AD-DNSHealth.ps1 -OutputPath C:\Reports -SkipLiveTests
 
 .NOTES
     Author  : Mohamed ZEGHLACHE
