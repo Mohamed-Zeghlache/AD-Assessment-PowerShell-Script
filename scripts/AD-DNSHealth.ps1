@@ -156,6 +156,16 @@ $LiveDCs = @()
 try { $LiveDCs = @(Get-ADDomainController -Filter * -ErrorAction Stop) } catch { $LiveDCs = @() }
 $LiveDcNames = @($LiveDCs | ForEach-Object { $_.HostName.ToLower() })
 $LiveDcShort = @($LiveDCs | ForEach-Object { ($_.Name).ToLower() })
+# DCs of EVERY domain in the forest: the forest-wide _msdcs zone also holds child-domain DCs,
+# so the stale-record check must compare against all of them, not just this domain's.
+$ForestDcShort = @($LiveDcShort)
+if ($Forest) {
+    foreach ($fd in @($Forest.Domains)) {
+        try { $ForestDcShort += @(Get-ADDomainController -Filter * -Server $fd -ErrorAction Stop | ForEach-Object { ($_.Name).ToLower() }) }
+        catch { Write-Host "      Could not list DCs of domain $fd - stale-record results may include its DCs" -ForegroundColor DarkYellow }
+    }
+}
+$ForestDcShort = @($ForestDcShort | Select-Object -Unique)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Per-server scavenging configuration
@@ -322,7 +332,7 @@ function Get-StaleDcRecords {
     }
     $stale
 }
-$StaleDc = @(Get-StaleDcRecords -Srv $Server -Domain $DomainDNS -LiveShort $LiveDcShort)
+$StaleDc = @(Get-StaleDcRecords -Srv $Server -Domain $DomainDNS -LiveShort $ForestDcShort)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Live per-DC health tests (resolution + dcdiag when available)

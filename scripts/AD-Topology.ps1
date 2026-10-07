@@ -34,6 +34,9 @@
 
 .EXAMPLE
     .\AD-Topology.ps1 -OutputPath C:\Reports -OpenReport:$false
+.EXAMPLE
+    .\AD-Topology.ps1 -ForestName contoso.com
+    Report on a specific forest (for example a trusted forest) instead of the current one.
 #>
 [CmdletBinding()]
 param(
@@ -43,7 +46,10 @@ param(
     # these thresholds. Inter-site defaults to 6h because the DEFAULT site-link schedule
     # is 180 minutes - a flat 3h threshold produces false positives.
     [int]$ReplDelayIntraSiteHours = 1,
-    [int]$ReplDelayInterSiteHours = 6
+    [int]$ReplDelayInterSiteHours = 6,
+    # Optional: forest to report on (DNS name of the forest root, or a DC in it).
+    # Default: the forest of the current user/computer.
+    [string]$ForestName
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,10 +221,13 @@ function Get-DCLiveHealth {
     return $r
 }
 
+# Forest-level queries target -ForestName when given, otherwise the current forest.
+$FS = @{}
+if ($ForestName) { $FS = @{ Server = $ForestName }; Write-Host "  Target forest: $ForestName" -ForegroundColor Gray }
 Write-Host "  Querying AD for topology data..." -ForegroundColor Yellow
 $orphanedDCs = @()
 try {
-    $Forest  = Get-ADForest -ErrorAction Stop
+    $Forest  = Get-ADForest @FS -ErrorAction Stop
     $ADTopo  = @()
     $Domains = @()
     $LocalName = $env:COMPUTERNAME
@@ -226,8 +235,8 @@ try {
     # ── Orphaned NTDS metadata detection (config partition vs real DCs) ──
     Write-Host "  Checking for orphaned DC metadata..." -ForegroundColor Yellow
     try {
-        $configNC = (Get-ADRootDSE).configurationNamingContext
-        $ntdsObjs = @(Get-ADObject -SearchBase "CN=Sites,$configNC" -LDAPFilter '(objectClass=nTDSDSA)' -ErrorAction SilentlyContinue)
+        $configNC = (Get-ADRootDSE @FS).configurationNamingContext
+        $ntdsObjs = @(Get-ADObject @FS -SearchBase "CN=Sites,$configNC" -LDAPFilter '(objectClass=nTDSDSA)' -ErrorAction SilentlyContinue)
         $ntdsServers = @()
         foreach ($n in $ntdsObjs) {
             # NTDS Settings DN: CN=NTDS Settings,CN=<DC>,CN=Servers,CN=<Site>,CN=Sites,...
@@ -242,7 +251,14 @@ try {
             }
             $ntdsServers += [PSCustomObject]@{ name=$srvName; site=$srvSite; dn=$serverDN }
         }
-        $realDCNames = @((Get-ADDomainController -Filter * -ErrorAction SilentlyContinue) | ForEach-Object { $_.Name })
+        # Real DCs from EVERY domain in the forest - Get-ADDomainController -Filter * on its own only
+        # returns the current domain's DCs, which made child-domain DCs look orphaned (issue #1).
+        $realDCNames = @()
+        foreach ($TargetDomain in @($Forest.Domains)) {
+            try { $realDCNames += @(Get-ADDomainController -Filter * -Server $TargetDomain -ErrorAction Stop | ForEach-Object { $_.Name }) }
+            catch { Write-Host "    Could not list DCs of domain $TargetDomain - its DCs are excluded from the orphan check" -ForegroundColor DarkYellow }
+        }
+        $realDCNames = @($realDCNames | Select-Object -Unique)
         foreach ($srv in $ntdsServers) {
             if ($realDCNames -notcontains $srv.name) {
                 Write-Host "    ORPHAN: $($srv.name) (site $($srv.site)) - in Sites&Services but not a replicating DC" -ForegroundColor Red
@@ -367,7 +383,7 @@ try {
 # ─────────────────────────────────────────────────────────────────────────────
 $SiteLinksJSON = "[]"
 try {
-    $links = @(Get-ADReplicationSiteLink -Filter * -ErrorAction SilentlyContinue | ForEach-Object {
+    $links = @(Get-ADReplicationSiteLink @FS -Filter * -ErrorAction SilentlyContinue | ForEach-Object {
         @{
             Name                          = $_.Name
             Cost                          = $_.Cost
@@ -394,8 +410,8 @@ if ($AuditResults -and $AuditResults.ReplicationHealth -is [array]) {
 $SubnetsJSON = "{}"
 $SubnetMap = @{}
 try {
-    foreach ($site in (Get-ADReplicationSite -Filter * -ErrorAction SilentlyContinue)) {
-        $subnets = Get-ADReplicationSubnet -Filter "Site -eq '$($site.Name)'" -ErrorAction SilentlyContinue
+    foreach ($site in (Get-ADReplicationSite @FS -Filter * -ErrorAction SilentlyContinue)) {
+        $subnets = Get-ADReplicationSubnet @FS -Filter "Site -eq '$($site.Name)'" -ErrorAction SilentlyContinue
         $SubnetMap[$site.Name] = if ($subnets) { ($subnets | ForEach-Object { $_.Name }) -join ", " } else { "" }
     }
 } catch {}
@@ -410,12 +426,12 @@ Write-Host "  Building replication health matrix..." -ForegroundColor Yellow
 # on its own only returns the CURRENT domain's DCs).
 $AllDCObjs = @()
 try {
-    $forestDomains = @((Get-ADForest -ErrorAction Stop).Domains)
+    $forestDomains = @((Get-ADForest @FS -ErrorAction Stop).Domains)
 } catch {
     $forestDomains = @()
 }
 if ($forestDomains.Count -eq 0) {
-    try { $forestDomains = @((Get-ADDomain -ErrorAction Stop).DNSRoot) } catch {}
+    try { $forestDomains = @((Get-ADDomain @FS -ErrorAction Stop).DNSRoot) } catch {}
 }
 foreach ($domDNS in $forestDomains) {
     try { $AllDCObjs += @(Get-ADDomainController -Filter * -Server $domDNS -ErrorAction SilentlyContinue) } catch {}
@@ -608,14 +624,14 @@ Write-Host "    $($ReplMatrix.Count) partnership/partition record(s) across $($D
 Write-Host "  Scanning for stale / lingering objects..." -ForegroundColor Yellow
 $StaleFindings = @()   # {category, severity, name, detail, dn, remediation}
 try {
-    $cfgNC   = (Get-ADRootDSE -ErrorAction Stop).configurationNamingContext
+    $cfgNC   = (Get-ADRootDSE @FS -ErrorAction Stop).configurationNamingContext
     $liveDCNames = @($AllDCObjs | ForEach-Object { $_.Name })
-    $allSites = @(Get-ADReplicationSite -Filter * -ErrorAction SilentlyContinue)
-    $allSubnets = @(Get-ADReplicationSubnet -Filter * -Properties Site -ErrorAction SilentlyContinue)
+    $allSites = @(Get-ADReplicationSite @FS -Filter * -ErrorAction SilentlyContinue)
+    $allSubnets = @(Get-ADReplicationSubnet @FS -Filter * -Properties Site -ErrorAction SilentlyContinue)
 
     # a) Orphaned NTDS Settings / server objects (server object with no live DC)
     try {
-        $serverObjs = @(Get-ADObject -SearchBase "CN=Sites,$cfgNC" -LDAPFilter '(objectClass=server)' -Properties name,distinguishedName -ErrorAction SilentlyContinue)
+        $serverObjs = @(Get-ADObject @FS -SearchBase "CN=Sites,$cfgNC" -LDAPFilter '(objectClass=server)' -Properties name,distinguishedName -ErrorAction SilentlyContinue)
         foreach ($so in $serverObjs) {
             if ($liveDCNames -notcontains $so.name) {
                 $siteName = if ($so.distinguishedName -match 'CN=Servers,CN=([^,]+),CN=Sites') { $Matches[1] } else { '?' }
@@ -669,7 +685,7 @@ try {
 
     # e) Lingering connection objects (NTDS connection whose 'fromServer' points to a dead server)
     try {
-        $connObjs = @(Get-ADObject -SearchBase "CN=Sites,$cfgNC" -LDAPFilter '(objectClass=nTDSConnection)' -Properties fromServer,distinguishedName -ErrorAction SilentlyContinue)
+        $connObjs = @(Get-ADObject @FS -SearchBase "CN=Sites,$cfgNC" -LDAPFilter '(objectClass=nTDSConnection)' -Properties fromServer,distinguishedName -ErrorAction SilentlyContinue)
         foreach ($co in $connObjs) {
             if ($co.fromServer -and $co.fromServer -match 'CN=NTDS Settings,CN=([^,]+),') {
                 $fromDC = $Matches[1]
@@ -694,7 +710,7 @@ Write-Host "    $($StaleFindings.Count) stale/lingering finding(s)" -ForegroundC
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. META
 # ─────────────────────────────────────────────────────────────────────────────
-$ForestName = try { (Get-ADForest -ErrorAction Stop).Name } catch { "Active Directory" }
+$ForestName = try { (Get-ADForest @FS -ErrorAction Stop).Name } catch { "Active Directory" }
 
 Write-Host "  Rendering HTML..." -ForegroundColor Cyan
 
