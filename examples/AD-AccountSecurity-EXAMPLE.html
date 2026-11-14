@@ -566,9 +566,10 @@ const NAV=[
  {id:'sec-orphansid',label:'Orphaned SIDs',icon:'bi-person-x'}
 ];
 function renderSidenav(){
-  document.getElementById('sidenav').innerHTML='<div class="navgroup">Report</div>'+NAV.map(function(n){return '<a class="navitem" href="#'+n.id+'"><i class="bi '+n.icon+'"></i> '+n.label+'</a>';}).join('');
+  document.getElementById('sidenav').innerHTML='<div class="navgroup">Report</div>'+NAV.map(function(n){return '<a class="navitem" href="#'+n.id+'" data-s="'+n.id+'"><i class="bi '+n.icon+'"></i> '+n.label+'</a>';}).join('');
 }
 function initScrollSpy(){
+  document.getElementById('sidenav').addEventListener('click',function(ev){var a=ev.target.closest?ev.target.closest('a[data-s]'):null;if(!a)return;ev.preventDefault();var t=document.getElementById(a.getAttribute('data-s'));if(t)t.scrollIntoView({behavior:'smooth',block:'start'});});
   var items=Array.prototype.slice.call(document.querySelectorAll('.navitem'));
   var secs=NAV.map(function(n){return document.getElementById(n.id);});
   function onScroll(){ var idx=0, y=window.scrollY+92; secs.forEach(function(sc,i){ if(sc && sc.offsetTop<=y) idx=i; }); items.forEach(function(it,i){ it.classList.toggle('active',i===idx); }); }

@@ -7,34 +7,48 @@
     offline, interactive HTML report (light/dark) covering five areas:
 
       1. PROTOCOLS & HARDENING (per domain controller)
-           LDAP signing, LDAP channel binding, LDAPS certificate, NTLM level,
+           LDAP signing, LDAP channel binding, LDAP client logging (event 2889), LDAPS
+           certificate, NTLM level,
            NTLM auditing, LM hash storage, SMB signing, SMBv1, SSL/TLS versions,
            LLMNR, NetBIOS, WDigest, LSA protection, Kerberos encryption types,
-           Print Spooler on DCs, plus DES-only accounts domain-wide.
+           Print Spooler on DCs, plus DES-only accounts in every domain.
       2. SECURITY EVENTS (last N days, every DC)
            Lockouts (4740), failed logons (4625) incl. password-spray detection,
            Kerberos pre-auth failures (4771), privileged group changes,
            audit log cleared (1102), and unsigned / clear-text LDAP binds
            (2887 / 2889) with the list of offending clients.
+           Old protocols still in use, with the clients behind them: LDAPS without
+           channel binding (3039), NTLMv1 logons (4624), Kerberos tickets issued with
+           RC4 or DES (4768 / 4769), NTLM authentications (8004 or 4776, workstation
+           names), SMBv1 clients (3000). Where a DC does not log one of these, the
+           report says what to turn on.
       3. TIME SYNC HIERARCHY
-           Configured type and NTP server, actual source, offset vs the PDC,
-           Hyper-V time provider.
+           Configured type and NTP server, actual source, offset vs the PDC of
+           the DC's own domain, Hyper-V time provider. Only the forest-root PDC
+           emulator should use external NTP.
       4. BACKUP & RECOVERY READINESS
            AD Recycle Bin, tombstone lifetime, last backup per partition,
-           SYSVOL replication (DFSR vs FRS).
+           SYSVOL replication (DFSR vs FRS) in every domain.
       5. WINDOWS SERVER 2025 READINESS
-           Functional levels, DC versions forest-wide, SYSVOL on DFSR, krbtgt and
-           service accounts without AES keys, RC4/DES-only accounts, users with
-           pre-AES passwords, legacy and non-Windows systems, Exchange versions.
+           Forest and domain functional levels, DC versions forest-wide, SYSVOL
+           on DFSR, DES-only accounts, NTLMv1, Exchange versions.
+
+    MULTI-DOMAIN FORESTS: every domain in the forest is covered. In the report,
+    a domain selector shows the whole forest or one domain at a time.
+
+    LARGE ENVIRONMENTS: domain controllers are checked several at a time
+    (-Throttle), on Windows PowerShell 5.1 - no PowerShell 7 needed.
 
     READ-ONLY. Registry values are read over CIM/DCOM (no WinRM needed);
     event logs over RPC. Unreachable DCs are reported, never waited on.
 
 .PARAMETER OutputPath       Folder for the HTML report (default: current dir).
-.PARAMETER EventDays        How many days of security events to analyse (default 7).
+.PARAMETER EventDays        How many days of security events to analyse (default 30).
 .PARAMETER MaxEventsPerDc   Cap per event query per DC (default 5000, newest first).
 .PARAMETER SkipEvents       Skip event log collection.
 .PARAMETER SkipTime         Skip w32tm time-source and offset checks.
+.PARAMETER Throttle         How many domain controllers are checked at the same time
+                            (default 10). Use 1 to check them one by one.
 .PARAMETER OpenReport       Open the report when done (default: $true).
 
 .NOTES
@@ -46,10 +60,11 @@
 [CmdletBinding()]
 param(
     [string]$OutputPath = (Get-Location).Path,
-    [int]$EventDays = 7,
+    [int]$EventDays = 30,
     [int]$MaxEventsPerDc = 5000,
     [switch]$SkipEvents,
     [switch]$SkipTime,
+    [ValidateRange(1,64)][int]$Throttle = 10,
     [switch]$OpenReport = $true
 )
 
@@ -68,21 +83,32 @@ $ReportPath = Join-Path $OutputPath "AD_DCPosture_$Stamp.html"
 
 Write-Host "AD DC Posture" -ForegroundColor Cyan
 Write-Host "=============" -ForegroundColor Cyan
-Write-Host "build: v14" -ForegroundColor DarkGray
-Write-Host "Domain: $DomainDNS   PDC: $PdcName" -ForegroundColor Gray
+Write-Host "build: v23" -ForegroundColor DarkGray
+Write-Host "Forest: $ForestDNS   Current domain: $DomainDNS" -ForegroundColor Gray
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers (PS 5.1-safe: hashtables, ArrayList, no pscustomobject in data)
 # ─────────────────────────────────────────────────────────────────────────────
 $HKLM = [uint32]2147483650
 function Test-Port {
+    # Resolves the name once, then tries each IPv4 address with its own timeout, so a slow
+    # DNS answer or a stale extra A record does not make a reachable DC look unreachable.
     param([string]$ComputerName,[int]$Port,[int]$TimeoutMs=1500)
-    $c = [System.Net.Sockets.TcpClient]::new()
-    try {
-        $iar = $c.BeginConnect($ComputerName,$Port,$null,$null)
-        if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs,$false) -and $c.Connected) { $c.EndConnect($iar); return $true }
-        return $false
-    } catch { return $false } finally { $c.Close() }
+    $targets = [System.Collections.ArrayList]::new()
+    $ip = $null
+    if ([System.Net.IPAddress]::TryParse($ComputerName,[ref]$ip)) { [void]$targets.Add($ip) }
+    else {
+        try { foreach ($a in [System.Net.Dns]::GetHostAddresses($ComputerName)) { if ($a.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { [void]$targets.Add($a) } } } catch {}
+        if ($targets.Count -eq 0) { [void]$targets.Add($ComputerName) }
+    }
+    foreach ($t in $targets) {
+        $c = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $iar = $c.BeginConnect($t,$Port,$null,$null)
+            if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs,$false) -and $c.Connected) { $c.EndConnect($iar); return $true }
+        } catch {} finally { $c.Close() }
+    }
+    return $false
 }
 function New-DcCimSession {
     param([string]$Name)
@@ -147,32 +173,101 @@ function Test-Ldaps { param([string]$HostName)
     return $res
 }
 
+# Runs a script block once per domain controller on a pool of runspaces (Windows PowerShell 5.1).
+# The script block gets the DC hashtable and writes its results into it. The listed helper
+# functions and variables are copied into every runspace. -Throttle 1 runs the DCs one by one.
+function Invoke-DcParallel {
+    param([System.Collections.IList]$Items,[scriptblock]$Script,[string[]]$Functions=@(),[hashtable]$Variables=@{},[int]$Throttle=10,[int]$TimeoutSec=0)
+    $tasks = [System.Collections.ArrayList]::new()
+    if (-not $Items -or $Items.Count -eq 0) { return ,$tasks }
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    foreach ($fn in $Functions) { [void]$iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($fn,(Get-Item ("Function:\" + $fn)).Definition)) }
+    foreach ($k in @($Variables.Keys)) { [void]$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($k,$Variables[$k],'')) }
+    $max = [math]::Max(1,[math]::Min($Throttle,$Items.Count))
+    $pool = [runspacefactory]::CreateRunspacePool(1,$max,$iss,$Host)
+    $pool.Open()
+    $timedOut = $false
+    try {
+        foreach ($it in $Items) {
+            $ps = [powershell]::Create(); $ps.RunspacePool = $pool
+            [void]$ps.AddScript($Script.ToString()).AddArgument($it)
+            [void]$tasks.Add(@{ ps=$ps; h=$ps.BeginInvoke(); item=$it; done=$false; error=''; timedOut=$false })
+        }
+        $deadline = [datetime]::MaxValue; if ($TimeoutSec -gt 0) { $deadline = (Get-Date).AddSeconds($TimeoutSec) }
+        $left = $tasks.Count; $n = 0
+        while ($left -gt 0) {
+            foreach ($t in $tasks) {
+                if ($t['done'] -or -not $t['h'].IsCompleted) { continue }
+                $t['done'] = $true; $left--; $n++
+                try { [void]$t['ps'].EndInvoke($t['h']) } catch { $t['error'] = [string]$_.Exception.Message }
+                $t['ps'].Dispose()
+                $nm = ''; if ($t['item'] -is [hashtable]) { $nm = [string]$t['item']['short'] }
+                Write-Host ("  {0} ({1}/{2})" -f $nm,$n,$tasks.Count) -ForegroundColor DarkGray
+            }
+            if ($left -le 0) { break }
+            if ((Get-Date) -gt $deadline) {
+                foreach ($t in $tasks) { if (-not $t['done']) { $t['done'] = $true; $t['timedOut'] = $true; $timedOut = $true; try { [void]$t['ps'].BeginStop($null,$null) } catch {} } }
+                break
+            }
+            Start-Sleep -Milliseconds 150
+        }
+    } finally {
+        # A pipeline that did not answer in time is stopped in the background, not waited on.
+        if ($timedOut) { try { [void]$pool.BeginClose($null,$null) } catch {} } else { $pool.Close(); $pool.Dispose() }
+    }
+    return ,$tasks
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Domain controllers
+# 1. Domain controllers (every domain in the forest)
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host "[1/6] Enumerating domain controllers..." -ForegroundColor Yellow
-$dcObjs = @(Get-ADDomainController -Filter *)
+# Forest root first, then the other domains alphabetically
+$AllDomains = [System.Collections.ArrayList]::new()
+$domRaw = [System.Collections.ArrayList]::new()
+if ($Forest -and @($Forest.Domains).Count) { foreach ($x in @($Forest.Domains)) { [void]$domRaw.Add([string]$x) } } else { [void]$domRaw.Add($DomainDNS) }
+$domKeys = [System.Collections.ArrayList]::new(); foreach ($x in $domRaw) { [void]$domKeys.Add($(if ($x -eq $ForestDNS) { '0' } else { '1' }) + $x.ToLower()) }
+Fill-Sorted -Items $domRaw -Keys $domKeys -Out $AllDomains
+$Multi = [bool]($AllDomains.Count -gt 1)
+$DomInfo = @{}; $DomNotes = [System.Collections.ArrayList]::new()
 $DcList = [System.Collections.ArrayList]::new()
 $DcKeys = [System.Collections.ArrayList]::new()
-foreach ($d in $dcObjs) {
-    $name = [string]$d.HostName
-    $short = ($name -split '\.')[0].ToUpper()
-    $os = [string]$d.OperatingSystem
-    $build = 0; try { $build = [int](([string]$d.OperatingSystemVersion) -replace '^.*\((\d+)\).*$','$1') } catch {}
-    [void]$DcList.Add(@{ name=$name; short=$short; site=[string]$d.Site; ip=[string]$d.IPv4Address; os=$os; build=$build;
-        isPdc=[bool]($name -eq $PdcName); rodc=[bool]$d.IsReadOnly; reachable=$false; regRead=$false; platform='Unknown'; model=''; settings=[System.Collections.ArrayList]::new();
-        ldaps=@{}; time=@{}; notes=[System.Collections.ArrayList]::new() })
-    $pk = if ($name -eq $PdcName) { '0' } else { '1' }
-    [void]$DcKeys.Add($pk + $short)
+foreach ($dom in $AllDomains) {
+    try {
+        $di = Get-ADDomain -Identity $dom -Server $dom -ErrorAction Stop
+        $DomInfo[$dom] = @{ pdc=[string]$di.PDCEmulator; dn=[string]$di.DistinguishedName }
+        $dcObjs = @(Get-ADDomainController -Filter * -Server $dom -ErrorAction Stop)
+    } catch {
+        Write-Host "  $dom could not be contacted: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        [void]$DomNotes.Add("Domain $dom could not be contacted from this host, so its domain controllers are not in this report.")
+        $DomInfo.Remove($dom); continue
+    }
+    $dPdc = [string]$DomInfo[$dom]['pdc']
+    $dk = if ($dom -eq $ForestDNS) { '0' } else { '1' }
+    foreach ($d in $dcObjs) {
+        $name = [string]$d.HostName
+        $short = ($name -split '\.')[0].ToUpper()
+        $os = [string]$d.OperatingSystem
+        $build = 0; try { $build = [int](([string]$d.OperatingSystemVersion) -replace '^.*\((\d+)\).*$','$1') } catch {}
+        $isPdc = [bool]($name -eq $dPdc)
+        [void]$DcList.Add(@{ name=$name; short=$short; domain=$dom; site=[string]$d.Site; ip=[string]$d.IPv4Address; os=$os; build=$build;
+            isPdc=$isPdc; rodc=[bool]$d.IsReadOnly; reachable=$false; regRead=$false; platform='Unknown'; model=''; settings=[System.Collections.ArrayList]::new();
+            ldaps=@{}; time=@{}; notes=[System.Collections.ArrayList]::new() })
+        $pk = if ($isPdc) { '0' } else { '1' }
+        [void]$DcKeys.Add($dk + $dom.ToLower() + '|' + $pk + $short)
+    }
 }
 $DCS = [System.Collections.ArrayList]::new(); Fill-Sorted -Items $DcList -Keys $DcKeys -Out $DCS
-Write-Host "  $($DCS.Count) domain controller(s)" -ForegroundColor Gray
+$PdcMap = @{}; foreach ($k in @($DomInfo.Keys)) { $PdcMap[$k] = [string]$DomInfo[$k]['pdc'] }
+$RootPdc = $PdcName; if ($PdcMap.ContainsKey($ForestDNS)) { $RootPdc = [string]$PdcMap[$ForestDNS] }
+Write-Host "  $($DCS.Count) domain controller(s) in $($AllDomains.Count) domain(s)" -ForegroundColor Gray
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Protocols & hardening (per DC)
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host "[2/6] Reading protocol and hardening settings..." -ForegroundColor Yellow
 $kNtds   = 'SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
+$kNtdsDg = 'SYSTEM\CurrentControlSet\Services\NTDS\Diagnostics'
 $kLsa    = 'SYSTEM\CurrentControlSet\Control\Lsa'
 $kMsv    = 'SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'
 $kNetlog = 'SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
@@ -182,10 +277,10 @@ $kDnsC   = 'SOFTWARE\Policies\Microsoft\Windows NT\DNSClient'
 $kWd     = 'SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest'
 $kKerb   = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters'
 $kW32    = 'SYSTEM\CurrentControlSet\Services\W32Time'
-
-foreach ($dc in $DCS) {
+# One runspace per DC: the results are written into the DC hashtable
+$SetScript = {
+  param($dc)
   $n = $dc['name']
-  Write-Host "  $($dc['short'])..." -ForegroundColor DarkGray
   try {
     # LDAPS is tested from this host (does not need registry access)
     $l = Test-Ldaps -HostName $n
@@ -197,7 +292,7 @@ foreach ($dc in $DCS) {
     else { [void]$dc['settings'].Add((New-Setting 'ldaps' ("Valid until " + $l['expires']) 'ok' 'LDAPS certificate valid' '')) }
 
     $s = New-DcCimSession -Name $n
-    if (-not $s) { [void]$dc['notes'].Add('Remote management (DCOM/WinRM) not reachable - registry settings were not read.'); continue }
+    if (-not $s) { [void]$dc['notes'].Add('Remote management (DCOM/WinRM) not reachable - registry settings were not read.'); return }
     $dc['reachable'] = $true
     try {
       $probe = Get-RegString $s 'SYSTEM\CurrentControlSet\Control\ProductOptions' 'ProductType'
@@ -215,6 +310,13 @@ foreach ($dc in $DCS) {
         elseif ($v -eq 1) { [void]$dc['settings'].Add((New-Setting 'ldapCbt' 'When supported' 'warn' 'LDAP channel binding not enforced' 'Move LDAP channel binding to Always once all LDAPS clients support it.')) }
         elseif ($v -eq 0) { [void]$dc['settings'].Add((New-Setting 'ldapCbt' 'Never' 'warn' 'LDAP channel binding disabled' 'Enable LDAP channel binding (When supported first, then Always).')) }
         else { [void]$dc['settings'].Add((New-Setting 'ldapCbt' 'Not configured' 'warn' 'LDAP channel binding not configured' 'Configure LDAP channel binding explicitly (When supported first, then Always) rather than relying on the OS default.')) }
+        # LDAP client logging: event 2889 (IP and account of each unsigned or clear-text bind) is only written at level 2 or more
+        $lg = Get-RegDword $s $kNtdsDg '16 LDAP Interface Events'
+        $sg = Get-RegDword $s $kNtds 'LDAPServerIntegrity'
+        $lgTxt = if ($null -eq $lg -or $lg -eq 0) { 'Off' } else { "Level $lg" }
+        if ($sg -eq 2) { [void]$dc['settings'].Add((New-Setting 'ldapLog' ($lgTxt + ' (not needed: signing required)') 'ok' 'LDAP client logging not needed' '')) }
+        elseif ($null -ne $lg -and $lg -ge 2) { [void]$dc['settings'].Add((New-Setting 'ldapLog' ($lgTxt + ' (event 2889 logged)') 'ok' 'LDAP client logging on' '')) }
+        else { [void]$dc['settings'].Add((New-Setting 'ldapLog' ($lgTxt + ' (event 2889 not logged)') 'info' 'LDAP client logging off' 'Raise LDAP interface event logging to 2 on this domain controller for a day or two, so each client making an unsigned or clear-text bind is recorded (event 2889) before LDAP signing is required. Set it back to 0 afterwards.')) }
         # NTLM level
         $v = Get-RegDword $s $kLsa 'LmCompatibilityLevel'
         $lv = if ($null -eq $v) { 3 } else { [int]$v }
@@ -242,6 +344,8 @@ foreach ($dc in $DCS) {
         if ($v -eq 0 -or $smb1On -eq $false) { [void]$dc['settings'].Add((New-Setting 'smb1' 'Disabled' 'ok' 'SMBv1 disabled' '')) }
         elseif ($smb1On -eq $true -or $v -eq 1) { [void]$dc['settings'].Add((New-Setting 'smb1' 'Enabled' 'crit' 'SMBv1 enabled' 'Remove the SMB 1.0 feature from domain controllers after confirming no legacy clients depend on it.')) }
         else { [void]$dc['settings'].Add((New-Setting 'smb1' 'Unknown' 'info' 'SMBv1 state could not be determined' 'Verify that the SMB 1.0 feature is removed.')) }
+        # What this DC logs about old protocols (used by the Security events step)
+        $dc['logcfg'] = @{ ldap=$lg; ntlmAudit=$au; smb1Off=[bool]($v -eq 0 -or $smb1On -eq $false); smb1Audit=(Get-RegDword $s $kSmb 'AuditSmb1Access') }
         # SSL / TLS (server side)
         $parts = [System.Collections.ArrayList]::new(); $tlsSev = 'ok'
         foreach ($p in 'SSL 2.0','SSL 3.0','TLS 1.0','TLS 1.1','TLS 1.2') {
@@ -326,31 +430,73 @@ foreach ($dc in $DCS) {
     } finally { Remove-CimSession $s -ErrorAction SilentlyContinue }
   } catch { [void]$dc['notes'].Add("Collection error: $($_.Exception.Message)") }
 }
+$tasks = Invoke-DcParallel -Items $DCS -Script $SetScript -Functions @('Test-Port','New-DcCimSession','Get-RegDword','Get-RegString','Test-RegKey','New-Setting','Test-Ldaps') -Variables @{ HKLM=$HKLM; kNtds=$kNtds; kNtdsDg=$kNtdsDg; kLsa=$kLsa; kMsv=$kMsv; kNetlog=$kNetlog; kSmb=$kSmb; kSchan=$kSchan; kDnsC=$kDnsC; kWd=$kWd; kKerb=$kKerb; kW32=$kW32 } -Throttle $Throttle
+foreach ($t in $tasks) { if ($t['error']) { [void]$t['item']['notes'].Add('Collection error: ' + $t['error']) } }
 
-# Domain-wide: accounts with DES-only Kerberos
+# Accounts with DES-only Kerberos, in every domain
 $DesOnly = [System.Collections.ArrayList]::new()
-try {
-    $des = @(Get-ADObject -LDAPFilter '(userAccountControl:1.2.840.113556.1.4.803:=2097152)' -Properties sAMAccountName -ResultSetSize 500)
-    foreach ($o in $des) { [void]$DesOnly.Add(@{ name=[string]$o.Name; sam=[string]$o.sAMAccountName; dn=[string]$o.DistinguishedName }) }
-} catch {}
+foreach ($dom in $AllDomains) {
+    if (-not $DomInfo.ContainsKey($dom)) { continue }
+    try {
+        $des = @(Get-ADObject -LDAPFilter '(userAccountControl:1.2.840.113556.1.4.803:=2097152)' -Properties sAMAccountName -Server $dom -ResultSetSize 500 -ErrorAction Stop)
+        foreach ($o in $des) { [void]$DesOnly.Add(@{ name=[string]$o.Name; sam=[string]$o.sAMAccountName; dn=[string]$o.DistinguishedName; domain=$dom }) }
+    } catch {}
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Security events
 # ─────────────────────────────────────────────────────────────────────────────
 $Since = (Get-Date).AddDays(-$EventDays)
+$SinceMs = [int64]((Get-Date) - $Since).TotalMilliseconds
 $EV = @{ collected=$false; days=$EventDays; ok=[System.Collections.ArrayList]::new(); failed=[System.Collections.ArrayList]::new();
          lockouts=[System.Collections.ArrayList]::new(); failAccounts=[System.Collections.ArrayList]::new(); failSources=[System.Collections.ArrayList]::new(); failTotal=0;
          kerbAccounts=[System.Collections.ArrayList]::new(); kerbTotal=0; privChanges=[System.Collections.ArrayList]::new(); cleared=[System.Collections.ArrayList]::new();
          ldapDc=[System.Collections.ArrayList]::new(); ldapClients=[System.Collections.ArrayList]::new() }
 $PrivGroups = @('Domain Admins','Enterprise Admins','Schema Admins','Administrators','Account Operators','Backup Operators','Server Operators','Print Operators','DnsAdmins','Group Policy Creator Owners','Cert Publishers','Enterprise Key Admins','Key Admins')
-function Get-Events { param([string]$Dc,[string]$Log,[int[]]$Ids)
-    try { return @(Get-WinEvent -ComputerName $Dc -FilterHashtable @{ LogName=$Log; Id=$Ids; StartTime=$Since } -MaxEvents $MaxEventsPerDc -ErrorAction Stop) }
-    catch { if ($_.Exception.Message -match 'No events were found') { return @() } throw }
+# Events are read with the .NET event log reader: newest first, filtered on the DC (XPath), and only the
+# event data is fetched. Get-WinEvent also formats the full message of every event, which over the network
+# costs an extra round trip per event and made this step slow.
+function Read-Events { param([string]$Dc,[string]$Log,[string]$XPath,[int]$Max,[switch]$Named)
+    $out = [System.Collections.ArrayList]::new()
+    $ses = [System.Diagnostics.Eventing.Reader.EventLogSession]::new($Dc)
+    try {
+        $q = [System.Diagnostics.Eventing.Reader.EventLogQuery]::new($Log, [System.Diagnostics.Eventing.Reader.PathType]::LogName, $XPath)
+        $q.Session = $ses; $q.ReverseDirection = $true
+        $rd = [System.Diagnostics.Eventing.Reader.EventLogReader]::new($q)
+        # Keep only what is used (values, and the XML when fields are read by name), then release each record
+        try { $rd.BatchSize = 500
+              while ($out.Count -lt $Max) { $e = $rd.ReadEvent(); if ($null -eq $e) { break }
+                  # First event of each ID: keep its full Windows text as an example for the report (one lookup per ID)
+                  if ($EvSamples -is [hashtable]) { $sid = [int]$e.Id
+                      if (-not $EvSamples.ContainsKey($sid)) { $m = ''; try { $m = [string]$e.FormatDescription() } catch {}
+                          $EvSamples[$sid] = $(if ($m) { @{ msg=$(if ($m.Length -gt 6000) { $m.Substring(0,6000) } else { $m }); time=(Fmt-Date $e.TimeCreated) } } else { $null }) } }
+                  try { [void]$out.Add([pscustomobject]@{ Id=$e.Id; TimeCreated=$e.TimeCreated; Properties=@($e.Properties); Xml=$(if ($Named) { $e.ToXml() } else { '' }) }) } finally { $e.Dispose() } } }
+        finally { $rd.Dispose() }
+    } finally { $ses.Dispose() }
+    $out   # one item per event (callers wrap it in @())
+}
+function XIds { param([int[]]$Ids) '*[System[(' + (($Ids | ForEach-Object { "EventID=$_" }) -join ' or ') + ") and TimeCreated[timediff(@SystemTime) <= $SinceMs]]]" }
+function Get-Events { param([string]$Dc,[string]$Log,[int[]]$Ids,[int]$Max=0,[switch]$Named)
+    if ($Max -le 0) { $Max = $MaxEventsPerDc }
+    Read-Events $Dc $Log (XIds $Ids) $Max -Named:$Named
 }
 function PropVal { param($E,[int]$I) try { return [string]$E.Properties[$I].Value } catch { return '' } }
-# aggregation tables: key -> hashtable
-$aLock=@{}; $aFailAcc=@{}; $aFailSrc=@{}; $aKerb=@{}; $aLdapCli=@{}; $EVDaily=@{}
-function Bump-Day { param($When,[string]$T) try { $k=([datetime]$When).ToString('yyyy-MM-dd'); if (-not $EVDaily.ContainsKey($k)) { $EVDaily[$k]=@{ f=0; k=0; l=0 } }; $EVDaily[$k][$T] = [int]$EVDaily[$k][$T] + 1 } catch {} }
+# Filtered read (XPath), so busy logs such as 4624 / 4769 only return the events that matter
+function Get-EventsX { param([string]$Dc,[string]$Log,[string]$XPath) Read-Events $Dc $Log $XPath $MaxEventsPerDc -Named }
+# $true: the event is recorded in the period; $false: not one; $null: the log could not be read
+function Test-AnyEvent { param([string]$Dc,[string]$Log,[int]$Id)
+    try { return [bool](@(Read-Events $Dc $Log (XIds @($Id)) 1).Count) } catch { return $null }
+}
+function EvData { param($E) $h = @{}; try { foreach ($d in ([xml]$E.Xml).Event.EventData.Data) { $h[[string]$d.Name] = [string]$d.InnerText } } catch {}; $h }
+# Raw events keep their domain, so the report can show the whole forest or one domain
+$EVByDomain = @{}
+$RAW = @{ lock=[System.Collections.ArrayList]::new(); fail=[System.Collections.ArrayList]::new(); kerb=[System.Collections.ArrayList]::new();
+          priv=[System.Collections.ArrayList]::new(); clear=[System.Collections.ArrayList]::new(); ldapDc=[System.Collections.ArrayList]::new();
+          ldapCli=[System.Collections.ArrayList]::new(); samples=[System.Collections.ArrayList]::new(); ok=[System.Collections.ArrayList]::new(); failed=[System.Collections.ArrayList]::new();
+          cbt=[System.Collections.ArrayList]::new(); ntlm1=[System.Collections.ArrayList]::new(); weak=[System.Collections.ArrayList]::new();
+          ntlm=[System.Collections.ArrayList]::new(); smb1=[System.Collections.ArrayList]::new(); cov=[System.Collections.ArrayList]::new() }
+
+function Bump-Day { param([hashtable]$Daily,$When,[string]$T) try { $k=([datetime]$When).ToString('yyyy-MM-dd'); if (-not $Daily.ContainsKey($k)) { $Daily[$k]=@{ f=0; k=0; l=0 } }; $Daily[$k][$T] = [int]$Daily[$k][$T] + 1 } catch {} }
 function Agg { param([hashtable]$T,[string]$Key,[string]$Label,[string]$Dc,[datetime]$When,[string]$Other)
     if (-not $T.ContainsKey($Key)) { $T[$Key] = @{ name=$Label; count=0; dcs=@{}; others=@{}; last=[datetime]::MinValue } }
     $e = $T[$Key]; $e['count'] = [int]$e['count'] + 1; $e['dcs'][$Dc] = $true
@@ -378,67 +524,179 @@ $EV['skipped'] = [bool]$SkipEvents
 if (-not $SkipEvents) {
     Write-Host "[3/6] Reading security events (last $EventDays days)..." -ForegroundColor Yellow
     $EV['collected'] = $true
-    foreach ($dc in $DCS) {
-        $n = $dc['name']; $sn = $dc['short']
-        if (-not (Test-Port -ComputerName $n -Port 135 -TimeoutMs 1500)) { [void]$EV['failed'].Add(@{ dc=$sn; reason='RPC (135) not reachable' }); continue }
-        Write-Host "  $sn..." -ForegroundColor DarkGray
+    # One runspace per DC: reads the logs and stores the raw events in $dc['ev']
+    $EvScript = {
+        param($dc)
+        $n = $dc['name']; $sn = $dc['short']; $dom = [string]$dc['domain']
+        $r = @{ lock=[System.Collections.ArrayList]::new(); fail=[System.Collections.ArrayList]::new(); kerb=[System.Collections.ArrayList]::new();
+                priv=[System.Collections.ArrayList]::new(); clear=[System.Collections.ArrayList]::new(); ldapDc=[System.Collections.ArrayList]::new();
+                ldapCli=[System.Collections.ArrayList]::new(); ok=$false; reason='';
+                cbt=[System.Collections.ArrayList]::new(); ntlm1=[System.Collections.ArrayList]::new(); weak=[System.Collections.ArrayList]::new();
+                ntlm=[System.Collections.ArrayList]::new(); smb1=[System.Collections.ArrayList]::new(); cov=$null }
+        $dc['ev'] = $r
+        $EvSamples = @{}; $r['samples'] = $EvSamples
+        if (-not $dc['reachable'] -and -not (Test-Port -ComputerName $n -Port 135 -TimeoutMs 1500)) { $r['reason'] = 'RPC (135) not reachable'; return }
         try {
-            foreach ($e in (Get-Events $n 'Security' @(4740))) { $acc=PropVal $e 0; $src=PropVal $e 1; Agg $aLock $acc.ToLower() $acc $n $e.TimeCreated $src; Bump-Day $e.TimeCreated 'l' }
+            foreach ($e in (Get-Events $n 'Security' @(4740))) { [void]$r['lock'].Add(@{ acc=(PropVal $e 0); src=(PropVal $e 1); dc=$n; domain=$dom; time=$e.TimeCreated }) }
             foreach ($e in (Get-Events $n 'Security' @(4625))) {
                 $acc=PropVal $e 5; $ip=PropVal $e 19; $ws=PropVal $e 13
                 $src = if ($ip -and $ip -ne '-') { $ip } elseif ($ws -and $ws -ne '-') { $ws } else { 'unknown' }
-                Agg $aFailAcc $acc.ToLower() $acc $n $e.TimeCreated $src
-                Agg $aFailSrc $src.ToLower() $src $n $e.TimeCreated $acc.ToLower()
-                $EV['failTotal'] = [int]$EV['failTotal'] + 1; Bump-Day $e.TimeCreated 'f'
+                [void]$r['fail'].Add(@{ acc=$acc; src=$src; dc=$n; domain=$dom; time=$e.TimeCreated })
             }
-            foreach ($e in (Get-Events $n 'Security' @(4771))) {
-                $acc=PropVal $e 0; $ip=(PropVal $e 6) -replace '^::ffff:',''
-                Agg $aKerb $acc.ToLower() $acc $n $e.TimeCreated $ip
-                $EV['kerbTotal'] = [int]$EV['kerbTotal'] + 1; Bump-Day $e.TimeCreated 'k'
-            }
+            foreach ($e in (Get-Events $n 'Security' @(4771))) { [void]$r['kerb'].Add(@{ acc=(PropVal $e 0); src=((PropVal $e 6) -replace '^::ffff:',''); dc=$n; domain=$dom; time=$e.TimeCreated }) }
             foreach ($e in (Get-Events $n 'Security' @(4728,4732,4756,4729,4733,4757))) {
                 $grp = PropVal $e 2
                 if ($PrivGroups -contains $grp) {
                     $act = if (@(4728,4732,4756) -contains [int]$e.Id) { 'added' } else { 'removed' }
                     $mem = PropVal $e 0; if ($mem -match '^CN=([^,]+)') { $mem = $Matches[1] }
-                    [void]$EV['privChanges'].Add(@{ time=(Fmt-Date $e.TimeCreated); dc=$sn; group=$grp; member=$mem; action=$act; by=(PropVal $e 6); id=[int]$e.Id })
+                    [void]$r['priv'].Add(@{ time=(Fmt-Date $e.TimeCreated); dc=$sn; domain=$dom; group=$grp; member=$mem; action=$act; by=(PropVal $e 6); id=[int]$e.Id })
                 }
             }
-            foreach ($e in (Get-Events $n 'Security' @(1102))) { [void]$EV['cleared'].Add(@{ time=(Fmt-Date $e.TimeCreated); dc=$sn; by=(PropVal $e 1) }) }
+            foreach ($e in (Get-Events $n 'Security' @(1102))) { [void]$r['clear'].Add(@{ time=(Fmt-Date $e.TimeCreated); dc=$sn; domain=$dom; by=(PropVal $e 1) }) }
             # LDAP binds (Directory Service log)
-            $s2887 = @(Get-Events $n 'Directory Service' @(2887))
-            if ($s2887.Count) { $last=$s2887[0]; [void]$EV['ldapDc'].Add(@{ dc=$sn; simple=[int](PropVal $last 0); unsignedSasl=[int](PropVal $last 1); when=(Fmt-Date $last.TimeCreated) }) }
+            $s2887 = @(Get-Events $n 'Directory Service' @(2887) 1)
+            if ($s2887.Count) { $last=$s2887[0]; [void]$r['ldapDc'].Add(@{ dc=$sn; domain=$dom; simple=[int](PropVal $last 0); unsignedSasl=[int](PropVal $last 1); when=(Fmt-Date $last.TimeCreated) }) }
             foreach ($e in (Get-Events $n 'Directory Service' @(2889))) {
                 $ipPort = PropVal $e 0; $ip = ($ipPort -replace ':\d+$','') -replace '^\[|\]$',''
-                $who = PropVal $e 1; $bt = PropVal $e 2
-                $btTxt = if ($bt -eq '1') { 'Simple bind without SSL/TLS' } else { 'Unsigned SASL bind' }
-                Agg $aLdapCli ($ip.ToLower() + '|' + $who.ToLower()) ($ip + '  (' + $who + ')') $n $e.TimeCreated $btTxt
+                [void]$r['ldapCli'].Add(@{ ip=$ip; who=(PropVal $e 1); bt=(PropVal $e 2); dc=$n; domain=$dom; time=$e.TimeCreated })
             }
-            [void]$EV['ok'].Add($sn)
-        } catch { [void]$EV['failed'].Add(@{ dc=$sn; reason=[string]$_.Exception.Message }) }
+            # Old protocols: who still uses them. Each read stands alone, so a missing log does not stop the others.
+            $lc = $dc['logcfg']
+            $cov = @{ dc=$sn; domain=$dom; known=[bool]$lc; ldap=$(if ($lc) { $lc['ldap'] } else { $null }); ntlmAudit=$(if ($lc) { $lc['ntlmAudit'] } else { $null });
+                      smb1Off=$(if ($lc) { $lc['smb1Off'] } else { $null }); smb1Audit=$(if ($lc) { $lc['smb1Audit'] } else { $null });
+                      n4624=$null; n4769=$null; n4776=$null; capNtlm1=$false; capWeak=$false; capNtlm=$false; ntlmFrom=''; err=[System.Collections.ArrayList]::new() }
+            $r['cov'] = $cov
+            try { foreach ($e in (Get-Events $n 'Directory Service' @(3039))) {
+                $ipPort = PropVal $e 0; $ip = ($ipPort -replace ':\d+$','') -replace '^\[|\]$',''
+                [void]$r['cbt'].Add(@{ ip=$ip; who=(PropVal $e 1); dc=$sn; domain=$dom; time=$e.TimeCreated }) } } catch { [void]$cov['err'].Add('3039') }
+            try {
+                $x = @(Get-EventsX $n 'Security' "*[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $SinceMs]]] and *[EventData[Data[@Name='LmPackageName']='NTLM V1']]")
+                foreach ($e in $x) { $d = EvData $e; [void]$r['ntlm1'].Add(@{ acc=($d['TargetDomainName'] + '\' + $d['TargetUserName']); ws=$d['WorkstationName']; ip=$d['IpAddress']; dc=$sn; domain=$dom; time=$e.TimeCreated }) }
+                $cov['capNtlm1'] = ($x.Count -ge $MaxEventsPerDc); $cov['n4624'] = Test-AnyEvent $n 'Security' 4624
+            } catch { [void]$cov['err'].Add('4624') }
+            try {
+                $x = @(Get-EventsX $n 'Security' ("*[System[(EventID=4768 or EventID=4769) and TimeCreated[timediff(@SystemTime) <= $SinceMs]]] and *[EventData[Data[@Name='Status']='0x0' and (" +
+                    "Data[@Name='TicketEncryptionType']='0x17' or Data[@Name='TicketEncryptionType']='0x18' or Data[@Name='TicketEncryptionType']='0x1' or Data[@Name='TicketEncryptionType']='0x3')]]"))
+                foreach ($e in $x) { $d = EvData $e
+                    $et = [string]$d['TicketEncryptionType']; $enc = if ($et -eq '0x17' -or $et -eq '0x18') { 'RC4' } else { 'DES' }
+                    [void]$r['weak'].Add(@{ acc=(($d['TargetUserName'] -split '@')[0]); svc=$d['ServiceName']; ip=(([string]$d['IpAddress']) -replace '^::ffff:',''); enc=$enc; id=[int]$e.Id; dc=$sn; domain=$dom; time=$e.TimeCreated }) }
+                $cov['capWeak'] = ($x.Count -ge $MaxEventsPerDc); $cov['n4769'] = Test-AnyEvent $n 'Security' 4769
+            } catch { [void]$cov['err'].Add('4769') }
+            # NTLM in use: NTLM auditing (8004, with the server) when it is on, else credential validation (4776)
+            try {
+                $x = @()
+                if ($lc -and $lc['ntlmAudit'] -gt 0) { try { $x = @(Get-Events $n 'Microsoft-Windows-NTLM/Operational' @(8004) -Named); $cov['ntlmFrom'] = '8004' } catch {} }
+                if ($cov['ntlmFrom'] -eq '8004') { foreach ($e in $x) { $d = EvData $e; [void]$r['ntlm'].Add(@{ acc=($d['DomainName'] + '\' + $d['UserName']); ws=$d['WorkstationName']; srv=$d['SChannelName']; dc=$sn; domain=$dom; time=$e.TimeCreated }) } }
+                else {
+                    $x = @(Get-Events $n 'Security' @(4776)); $cov['ntlmFrom'] = '4776'
+                    # 4776 fields by position (PackageName, TargetUserName, Workstation, Status): the busiest log, so no XML here
+                    foreach ($e in $x) { $st = PropVal $e 3; if ($st -and $st -ne '0' -and $st -ne '0x0') { continue }; [void]$r['ntlm'].Add(@{ acc=(PropVal $e 1); ws=(PropVal $e 2); srv=''; dc=$sn; domain=$dom; time=$e.TimeCreated }) }
+                    $cov['n4776'] = [bool]$x.Count
+                }
+                $cov['capNtlm'] = ($x.Count -ge $MaxEventsPerDc)
+            } catch { [void]$cov['err'].Add('ntlm') }
+            if (-not ($lc -and $lc['smb1Off'])) {
+                try { foreach ($e in (Get-Events $n 'Microsoft-Windows-SMBServer/Audit' @(3000) -Named)) { $d = EvData $e; $c = [string]$d['ClientName']; if (-not $c) { $c = PropVal $e 0 }
+                    [void]$r['smb1'].Add(@{ ip=($c -replace '^::ffff:','' -replace '^\[|\]$',''); dc=$sn; domain=$dom; time=$e.TimeCreated }) } } catch { [void]$cov['err'].Add('3000') }
+            }
+            $r['ok'] = $true
+        } catch { $r['reason'] = [string]$_.Exception.Message }
     }
-    $EV['lockouts'] = Flatten-Agg $aLock 200
-    $EV['failAccounts'] = Flatten-Agg $aFailAcc 200
-    $EV['failSources'] = Flatten-Agg $aFailSrc 200
-    $EV['kerbAccounts'] = Flatten-Agg $aKerb 200
-    $EV['ldapClients'] = Flatten-Agg $aLdapCli 500
-    $dl = [System.Collections.ArrayList]::new()
-    for ($i = $EventDays - 1; $i -ge 0; $i--) {
-        $dk = (Get-Date).AddDays(-$i).ToString('yyyy-MM-dd'); $dv = @{ f=0; k=0; l=0 }; if ($EVDaily.ContainsKey($dk)) { $dv = $EVDaily[$dk] }
-        [void]$dl.Add(@{ day=$dk; f=[int]$dv['f']; k=[int]$dv['k']; l=[int]$dv['l'] })
+    $tasks = Invoke-DcParallel -Items $DCS -Script $EvScript -Functions @('Test-Port','Read-Events','XIds','Get-Events','Get-EventsX','Test-AnyEvent','EvData','PropVal','Fmt-Date') -Variables @{ Since=$Since; SinceMs=$SinceMs; MaxEventsPerDc=$MaxEventsPerDc; PrivGroups=$PrivGroups } -Throttle $Throttle
+    foreach ($t in $tasks) {
+        $dc = $t['item']; $r = $dc['ev']; $sn = $dc['short']; $dom = [string]$dc['domain']
+        if ($r) {
+            foreach ($k in 'lock','fail','kerb','priv','clear','ldapDc','ldapCli','cbt','ntlm1','weak','ntlm','smb1') { foreach ($x in $r[$k]) { [void]$RAW[$k].Add($x) } }
+            if ($r['samples']) { foreach ($k in @($r['samples'].Keys)) { $v = $r['samples'][$k]; if ($v) { [void]$RAW['samples'].Add(@{ id=[int]$k; dc=$sn; domain=$dom; time=$v['time']; msg=$v['msg'] }) } } }
+            if ($r['cov']) { [void]$RAW['cov'].Add($r['cov']) }
+            if ($r['ok']) { [void]$RAW['ok'].Add(@{ dc=$sn; domain=$dom }) } else { [void]$RAW['failed'].Add(@{ dc=$sn; domain=$dom; reason=[string]$r['reason'] }) }
+        } else { [void]$RAW['failed'].Add(@{ dc=$sn; domain=$dom; reason=$(if ($t['error']) { [string]$t['error'] } else { 'Event logs could not be read' }) }) }
+        $dc.Remove('ev')
     }
-    $EV['daily'] = $dl
+    # Aggregates for one domain, or for the whole forest when $Dom is empty
+    function Build-EventSet { param([string]$Dom)
+        $set = @{ collected=$true; skipped=$false; days=$EventDays; ok=[System.Collections.ArrayList]::new(); failed=[System.Collections.ArrayList]::new(); failTotal=0; kerbTotal=0;
+                  privChanges=[System.Collections.ArrayList]::new(); cleared=[System.Collections.ArrayList]::new(); ldapDc=[System.Collections.ArrayList]::new() }
+        foreach ($x in $RAW['ok'])     { if (-not $Dom -or $x['domain'] -eq $Dom) { [void]$set['ok'].Add([string]$x['dc']) } }
+        foreach ($x in $RAW['failed']) { if (-not $Dom -or $x['domain'] -eq $Dom) { [void]$set['failed'].Add(@{ dc=$x['dc']; reason=$x['reason'] }) } }
+        foreach ($x in $RAW['priv'])   { if (-not $Dom -or $x['domain'] -eq $Dom) { [void]$set['privChanges'].Add($x) } }
+        foreach ($x in $RAW['clear'])  { if (-not $Dom -or $x['domain'] -eq $Dom) { [void]$set['cleared'].Add($x) } }
+        foreach ($x in $RAW['ldapDc']) { if (-not $Dom -or $x['domain'] -eq $Dom) { [void]$set['ldapDc'].Add($x) } }
+        $aLock=@{}; $aFailAcc=@{}; $aFailSrc=@{}; $aKerb=@{}; $aLdapCli=@{}; $daily=@{}
+        foreach ($x in $RAW['lock']) { if ($Dom -and $x['domain'] -ne $Dom) { continue }; $acc=[string]$x['acc']; Agg $aLock $acc.ToLower() $acc $x['dc'] $x['time'] ([string]$x['src']); Bump-Day $daily $x['time'] 'l' }
+        foreach ($x in $RAW['fail']) {
+            if ($Dom -and $x['domain'] -ne $Dom) { continue }
+            $acc=[string]$x['acc']; $src=[string]$x['src']
+            Agg $aFailAcc $acc.ToLower() $acc $x['dc'] $x['time'] $src
+            Agg $aFailSrc $src.ToLower() $src $x['dc'] $x['time'] $acc.ToLower()
+            $set['failTotal'] = [int]$set['failTotal'] + 1; Bump-Day $daily $x['time'] 'f'
+        }
+        foreach ($x in $RAW['kerb']) { if ($Dom -and $x['domain'] -ne $Dom) { continue }; $acc=[string]$x['acc']; Agg $aKerb $acc.ToLower() $acc $x['dc'] $x['time'] ([string]$x['src']); $set['kerbTotal'] = [int]$set['kerbTotal'] + 1; Bump-Day $daily $x['time'] 'k' }
+        foreach ($x in $RAW['ldapCli']) {
+            if ($Dom -and $x['domain'] -ne $Dom) { continue }
+            $ip=[string]$x['ip']; $who=[string]$x['who']
+            $btTxt = if ([string]$x['bt'] -eq '1') { 'Simple bind without SSL/TLS' } else { 'Unsigned SASL bind' }
+            Agg $aLdapCli ($ip.ToLower() + '|' + $who.ToLower()) ($ip + '  (' + $who + ')') $x['dc'] $x['time'] $btTxt
+        }
+        $set['lockouts'] = Flatten-Agg $aLock 200
+        $set['failAccounts'] = Flatten-Agg $aFailAcc 200
+        $set['failSources'] = Flatten-Agg $aFailSrc 200
+        $set['kerbAccounts'] = Flatten-Agg $aKerb 200
+        $set['ldapClients'] = Flatten-Agg $aLdapCli 500
+        # Old protocols, one row per client
+        $aCbt=@{}; $aN1=@{}; $aWeak=@{}; $aNtlm=@{}; $aSmb=@{}; $set['oldCov'] = [System.Collections.ArrayList]::new()
+        foreach ($x in $RAW['cov']) { if (-not $Dom -or $x['domain'] -eq $Dom) { [void]$set['oldCov'].Add($x) } }
+        foreach ($x in $RAW['cbt']) { if ($Dom -and $x['domain'] -ne $Dom) { continue }; $ip=[string]$x['ip']; Agg $aCbt $ip.ToLower() $ip $x['dc'] $x['time'] ([string]$x['who']) }
+        foreach ($x in $RAW['ntlm1']) {
+            if ($Dom -and $x['domain'] -ne $Dom) { continue }
+            $ip=[string]$x['ip']; $ws=[string]$x['ws']; if ($ip -eq '-') { $ip='' }; if ($ws -eq '-') { $ws='' }
+            $src = if ($ip -and $ws) { $ip + '  (' + $ws + ')' } elseif ($ip) { $ip } elseif ($ws) { $ws } else { 'unknown' }
+            Agg $aN1 $src.ToLower() $src $x['dc'] $x['time'] ([string]$x['acc'])
+        }
+        foreach ($x in $RAW['weak']) {
+            if ($Dom -and $x['domain'] -ne $Dom) { continue }
+            $ip=[string]$x['ip']; if (-not $ip -or $ip -eq '-') { $ip='unknown' }
+            Agg $aWeak $ip.ToLower() $ip $x['dc'] $x['time'] ([string]$x['enc'] + ': ' + [string]$x['acc'] + ' > ' + [string]$x['svc'])
+        }
+        foreach ($x in $RAW['ntlm']) {
+            if ($Dom -and $x['domain'] -ne $Dom) { continue }
+            $ws=[string]$x['ws']; if (-not $ws -or $ws -eq '-') { $ws='unknown' }
+            Agg $aNtlm $ws.ToLower() $ws $x['dc'] $x['time'] ([string]$x['acc'] + $(if ($x['srv']) { ' > ' + [string]$x['srv'] } else { '' }))
+        }
+        foreach ($x in $RAW['smb1']) { if ($Dom -and $x['domain'] -ne $Dom) { continue }; $ip=[string]$x['ip']; Agg $aSmb $ip.ToLower() $ip $x['dc'] $x['time'] '' }
+        $set['cbtClients'] = Flatten-Agg $aCbt 500
+        $set['ntlm1Clients'] = Flatten-Agg $aN1 500
+        $set['weakClients'] = Flatten-Agg $aWeak 500
+        $set['ntlmClients'] = Flatten-Agg $aNtlm 500
+        $set['smb1Clients'] = Flatten-Agg $aSmb 500
+        # One real event text per event ID (from the first DC that has one)
+        $smp = @{}; foreach ($x in $RAW['samples']) { if ($Dom -and $x['domain'] -ne $Dom) { continue }; $k = [string]$x['id']; if (-not $smp.ContainsKey($k)) { $smp[$k] = @{ dc=$x['dc']; time=$x['time']; msg=$x['msg'] } } }
+        $set['samples'] = $smp
+        $dl = [System.Collections.ArrayList]::new()
+        for ($i = $EventDays - 1; $i -ge 0; $i--) {
+            $dk = (Get-Date).AddDays(-$i).ToString('yyyy-MM-dd'); $dv = @{ f=0; k=0; l=0 }; if ($daily.ContainsKey($dk)) { $dv = $daily[$dk] }
+            [void]$dl.Add(@{ day=$dk; f=[int]$dv['f']; k=[int]$dv['k']; l=[int]$dv['l'] })
+        }
+        $set['daily'] = $dl
+        return $set
+    }
+    $fs = Build-EventSet ''
+    foreach ($k in @($fs.Keys)) { $EV[$k] = $fs[$k] }
+    if ($Multi) { foreach ($d in $AllDomains) { $EVByDomain[[string]$d] = Build-EventSet ([string]$d) } }
 } else { Write-Host "[3/6] Security events skipped" -ForegroundColor DarkGray }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Time sync (source + offset via w32tm, run in parallel with a timeout)
+# 4. Time sync (source + offset via w32tm, several DCs at a time, with a timeout)
 # ─────────────────────────────────────────────────────────────────────────────
 if (-not $SkipTime) {
     Write-Host "[4/6] Checking time sources and offsets..." -ForegroundColor Yellow
-    $jobs=@{}
-    foreach ($dc in $DCS) {
-        if (-not (Test-Port -ComputerName $dc['name'] -Port 135 -TimeoutMs 1500)) { continue }
-        $jobs[$dc['name']] = Start-Job -ScriptBlock { param($c)
+    $TimeScript = {
+        param($dc)
+        $c = $dc['name']
+        if (-not $dc['reachable'] -and -not (Test-Port -ComputerName $c -Port 135 -TimeoutMs 1500)) { return }
+        if (-not $dc['time'].Count) { $dc['time'] = @{ type=''; ntpServer=''; cfgBy=''; announce=$null; vmic=$null; source=''; offset=$null; offsetPdc=$null; error=''; lastSync=''; lastSyncDays=$null; stratum='' } }
+        $t = $dc['time']
+        try {
             $src = (& w32tm /query /computer:$c /source 2>&1 | Out-String)
             $sc  = (& w32tm /stripchart /computer:$c /samples:1 /dataonly 2>&1 | Out-String)
             $st  = (& w32tm /query /computer:$c /status 2>&1 | Out-String)
@@ -447,32 +705,30 @@ if (-not $SkipTime) {
                 if ($line -match '^\s*Last Successful Sync Time:\s*(.+)$') { $raw = $Matches[1].Trim(); try { $last = ([datetime]::Parse($raw)).ToString('yyyy-MM-dd HH:mm') } catch { $last = $raw } }
                 if ($line -match '^\s*Stratum:\s*(\d+)') { $strat = $Matches[1] }
             }
-            $src + '|||' + $sc + '|||' + $last + '|||' + $strat } -ArgumentList $dc['name']
+            $src = $src.Trim()
+            if ($src -match 'error|0x8') { $t['error'] = $src } else { $t['source'] = $src }
+            if ($sc -match '([+-]\d+\.\d+)s') { $t['offset'] = [double]$Matches[1] }
+            $t['lastSync'] = $last
+            try { $lsd = [datetime]::ParseExact($last,'yyyy-MM-dd HH:mm',[System.Globalization.CultureInfo]::InvariantCulture); $t['lastSyncDays'] = [int][math]::Floor(((Get-Date) - $lsd).TotalDays) } catch {}
+            $t['stratum'] = $strat
+        } catch { $t['error'] = [string]$_.Exception.Message }
     }
-    $jl=[System.Collections.ArrayList]::new(); foreach ($j in $jobs.Values) { [void]$jl.Add($j) }
-    if ($jl.Count) { Wait-Job -Job $jl.ToArray() -Timeout 45 | Out-Null }
-    foreach ($dc in $DCS) {
-        if (-not $jobs.ContainsKey($dc['name'])) { continue }
+    $thr = [math]::Max(1,$Throttle)
+    $tmo = 45 * [int][math]::Ceiling($DCS.Count / $thr) + 15
+    $tasks = Invoke-DcParallel -Items $DCS -Script $TimeScript -Functions @('Test-Port') -Throttle $Throttle -TimeoutSec $tmo
+    foreach ($t in $tasks) {
+        if (-not $t['timedOut']) { continue }
+        $dc = $t['item']
         if (-not $dc['time'].Count) { $dc['time'] = @{ type=''; ntpServer=''; cfgBy=''; announce=$null; vmic=$null; source=''; offset=$null; offsetPdc=$null; error=''; lastSync=''; lastSyncDays=$null; stratum='' } }
-        $j = $jobs[$dc['name']]
-        try {
-            if ($j.State -eq 'Completed') {
-                $out = [string](Receive-Job -Job $j)
-                $pp = $out -split '\|\|\|',4
-                $src = ([string]$pp[0]).Trim()
-                if ($src -match 'error|0x8') { $dc['time']['error'] = $src } else { $dc['time']['source'] = $src }
-                if ($pp.Count -gt 1 -and ([string]$pp[1]) -match '([+-]\d+\.\d+)s') { $dc['time']['offset'] = [double]$Matches[1] }
-                if ($pp.Count -gt 2) {
-                    $ls = ([string]$pp[2]).Trim(); $dc['time']['lastSync'] = $ls
-                    try { $lsd = [datetime]::ParseExact($ls,'yyyy-MM-dd HH:mm',[System.Globalization.CultureInfo]::InvariantCulture); $dc['time']['lastSyncDays'] = [int][math]::Floor(((Get-Date) - $lsd).TotalDays) } catch {}
-                }
-                if ($pp.Count -gt 3) { $dc['time']['stratum'] = ([string]$pp[3]).Trim() }
-            } else { Stop-Job -Job $j -ErrorAction SilentlyContinue; $dc['time']['error'] = 'w32tm did not answer in time' }
-        } catch { $dc['time']['error'] = [string]$_.Exception.Message }
-        Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
+        $dc['time']['error'] = 'w32tm did not answer in time'
     }
-    $pdcOff = $null; foreach ($dc in $DCS) { if ($dc['isPdc'] -and $dc['time'].Count -and $null -ne $dc['time']['offset']) { $pdcOff = [double]$dc['time']['offset'] } }
-    if ($null -ne $pdcOff) { foreach ($dc in $DCS) { if ($dc['time'].Count -and $null -ne $dc['time']['offset']) { $dc['time']['offsetPdc'] = [math]::Round(([double]$dc['time']['offset'] - $pdcOff),3) } } }
+    # Offset is measured against the PDC emulator of the DC's own domain
+    $pdcOff = @{}
+    foreach ($dc in $DCS) { if ($dc['isPdc'] -and $dc['time'].Count -and $null -ne $dc['time']['offset']) { $pdcOff[[string]$dc['domain']] = [double]$dc['time']['offset'] } }
+    foreach ($dc in $DCS) {
+        $ref = $pdcOff[[string]$dc['domain']]
+        if ($null -ne $ref -and $dc['time'].Count -and $null -ne $dc['time']['offset']) { $dc['time']['offsetPdc'] = [math]::Round(([double]$dc['time']['offset'] - [double]$ref),3) }
+    }
 } else { Write-Host "[4/6] Time checks skipped" -ForegroundColor DarkGray }
 
 # Evaluate time findings per DC
@@ -482,7 +738,9 @@ foreach ($dc in $DCS) {
     $src = [string]$t['source']; $type = [string]$t['type']; $plat = [string]$dc['platform']
     $local = [bool]($src -match 'Local CMOS Clock|Free-running')
     $gpo = ''; if ($t['cfgBy'] -eq 'Group Policy') { $gpo = ' This setting comes from Group Policy, so change it in the GPO that applies to this DC.' }
-    if ($dc['isPdc']) {
+    # Only the forest-root PDC emulator syncs from external NTP; child-domain PDCs follow the hierarchy
+    $isRootPdc = [bool]($dc['isPdc'] -and ([string]$dc['domain'] -eq $ForestDNS))
+    if ($isRootPdc) {
         if ($local -or ($type -and $type -ne 'NTP' -and $type -ne 'AllSync')) {
             $why = 'It is running on its own clock.'
             if ($type -eq 'NT5DS') { $why = 'It is set to follow the domain hierarchy (NT5DS), but as PDC emulator it is the top of that hierarchy, so it has no source and runs on its own clock.' }
@@ -491,7 +749,10 @@ foreach ($dc in $DCS) {
         }
     } else {
         if ($local) { [void]$f.Add(@{ sev='crit'; title='DC not syncing from the domain hierarchy'; advice=('It is running on its own clock. Check that it can reach other domain controllers on UDP 123 and that its time type is NT5DS (domain hierarchy).' + $gpo) }) }
-        if ($type -eq 'NTP') { [void]$f.Add(@{ sev='warn'; title='Manual NTP source on a non-PDC DC'; advice=('Set this DC back to domain hierarchy sync (NT5DS) so only the PDC emulator uses external NTP.' + $gpo) }) }
+        if ($type -eq 'NTP') {
+            if ($dc['isPdc']) { [void]$f.Add(@{ sev='warn'; title='Manual NTP source on a child-domain PDC'; advice=('Only the PDC emulator of the forest root domain should use external NTP. Set this PDC back to domain hierarchy sync (NT5DS) so it follows the parent domain.' + $gpo) }) }
+            else { [void]$f.Add(@{ sev='warn'; title='Manual NTP source on a non-PDC DC'; advice=('Set this DC back to domain hierarchy sync (NT5DS) so only the forest-root PDC emulator uses external NTP.' + $gpo) }) }
+        }
     }
     # The Hyper-V time provider only matters on Hyper-V and Azure
     if ($src -match 'VM IC Time') { [void]$f.Add(@{ sev='warn'; title='Syncing from the Hyper-V host'; advice='Disable the Hyper-V time synchronization provider on this domain controller so it follows the domain hierarchy.' }) }
@@ -507,10 +768,10 @@ foreach ($dc in $DCS) {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Backup & recovery readiness
+# 5. Backup & recovery readiness (forest settings + every domain)
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host "[5/6] Backup and recovery readiness..." -ForegroundColor Yellow
-$BK = @{ recycleBin=$null; recycleBinEnabled=$false; tombstone=$null; partitions=[System.Collections.ArrayList]::new(); sysvol=@{ mode=''; state=''; sev='' } }
+$BK = @{ recycleBin=$null; recycleBinEnabled=$false; tombstone=$null; partitions=[System.Collections.ArrayList]::new(); sysvol=@{ mode=''; state=''; sev='' }; sysvolDomains=[System.Collections.ArrayList]::new() }
 try {
     $rb = Get-ADOptionalFeature -Filter "Name -eq 'Recycle Bin Feature'" -ErrorAction Stop
     if ($rb) { $BK['recycleBin'] = $true; $sc = 0; foreach ($x in $rb.EnabledScopes) { if ($x) { $sc++ } }; $BK['recycleBinEnabled'] = [bool]($sc -gt 0) }
@@ -522,96 +783,80 @@ try {
     $ds = Get-ADObject ("CN=Directory Service,CN=Windows NT,CN=Services," + $cfg) -Properties tombstoneLifetime -ErrorAction Stop
     $tsl = 60; if ($ds.tombstoneLifetime) { $tsl = [int]$ds.tombstoneLifetime }
     $BK['tombstone'] = $tsl
-    foreach ($nc in @($root.namingContexts)) {
-        $ncs = [string]$nc; $last = $null; $err = ''
-        try {
-            $md = Get-ADReplicationAttributeMetadata -Object $ncs -Server $PdcName -Properties dSASignature -ErrorAction Stop
-            foreach ($m in @($md)) { if ([string]$m.AttributeName -eq 'dSASignature') { $last = $m.LastOriginatingChangeTime } }
-        } catch { $err = [string]$_.Exception.Message }
-        $days = $null; if ($last) { $days = [int][math]::Floor(((Get-Date) - [datetime]$last).TotalDays) }
-        $label = if ($ncs -eq $DomainDN) { 'Domain' } elseif ($ncs -like 'CN=Configuration,*') { 'Configuration' } elseif ($ncs -like 'CN=Schema,*') { 'Schema' } elseif ($ncs -like 'DC=DomainDnsZones,*') { 'DomainDnsZones' } elseif ($ncs -like 'DC=ForestDnsZones,*') { 'ForestDnsZones' } else { $ncs }
-        [void]$BK['partitions'].Add(@{ name=$label; dn=$ncs; last=(Fmt-Date $last); days=$days; error=$err })
-    }
 } catch {}
-$flRaw = $null; $dfsrGroup = $false
-try { $gs = Get-ADObject ("CN=DFSR-GlobalSettings,CN=System," + $DomainDN) -Properties 'msDFSR-Flags' -ErrorAction Stop; $flRaw = $gs.'msDFSR-Flags' } catch {}
-try { $null = Get-ADObject ("CN=Domain System Volume,CN=DFSR-GlobalSettings,CN=System," + $DomainDN) -ErrorAction Stop; $dfsrGroup = $true } catch {}
-if ($null -ne $flRaw -and [int]$flRaw -eq 48) { $BK['sysvol'] = @{ mode='DFSR'; state='Migrated from FRS (Eliminated state)'; sev='ok' } }
-elseif ($dfsrGroup -and $null -eq $flRaw) { $BK['sysvol'] = @{ mode='DFSR'; state='DFSR from the start'; sev='ok' } }
-elseif ($null -ne $flRaw -and ([int]$flRaw -eq 16 -or [int]$flRaw -eq 32)) { $BK['sysvol'] = @{ mode='FRS to DFSR migration'; state=$(if ([int]$flRaw -eq 16) { 'Prepared state - migration not finished' } else { 'Redirected state - migration not finished' }); sev='warn' } }
-else { $BK['sysvol'] = @{ mode='FRS'; state='SYSVOL is still replicated by FRS'; sev='crit' } }
+# Domain partitions of the other domains are skipped when a DC lists them (each domain reports its own)
+$DomDNs = @{}; foreach ($k in @($DomInfo.Keys)) { $DomDNs[[string]$DomInfo[$k]['dn']] = $k }
+$SeenNC = @{}
+foreach ($dom in $AllDomains) {
+    if (-not $DomInfo.ContainsKey($dom)) { continue }
+    $ddn = [string]$DomInfo[$dom]['dn']; $srv = [string]$DomInfo[$dom]['pdc']
+    $rootD = $null
+    try { $rootD = Get-ADRootDSE -Server $srv -ErrorAction Stop }
+    catch { try { $rootD = Get-ADRootDSE -Server $dom -ErrorAction Stop; $srv = [string]$rootD.dnsHostName } catch {} }
+    if ($rootD) {
+        $sfx = ''; if ($Multi) { $sfx = " ($dom)" }
+        foreach ($nc in @($rootD.namingContexts)) {
+            $ncs = [string]$nc; $last = $null; $err = ''
+            if ($SeenNC.ContainsKey($ncs)) { continue }
+            if ($DomDNs.ContainsKey($ncs) -and $ncs -ne $ddn) { continue }
+            if ($ncs -like 'DC=DomainDnsZones,*' -and $ncs -ne ('DC=DomainDnsZones,' + $ddn)) { continue }
+            $SeenNC[$ncs] = $true
+            try {
+                $md = Get-ADReplicationAttributeMetadata -Object $ncs -Server $srv -Properties dSASignature -ErrorAction Stop
+                foreach ($m in @($md)) { if ([string]$m.AttributeName -eq 'dSASignature') { $last = $m.LastOriginatingChangeTime } }
+            } catch { $err = [string]$_.Exception.Message }
+            $days = $null; if ($last) { $days = [int][math]::Floor(((Get-Date) - [datetime]$last).TotalDays) }
+            $label = if ($ncs -eq $ddn) { 'Domain' + $sfx } elseif ($ncs -like 'CN=Configuration,*') { 'Configuration' } elseif ($ncs -like 'CN=Schema,*') { 'Schema' } elseif ($ncs -like 'DC=DomainDnsZones,*') { 'DomainDnsZones' + $sfx } elseif ($ncs -like 'DC=ForestDnsZones,*') { 'ForestDnsZones' } else { $ncs }
+            $ncDom = ''; if ($ncs -eq $ddn -or $ncs -like 'DC=DomainDnsZones,*') { $ncDom = $dom }
+            [void]$BK['partitions'].Add(@{ name=$label; dn=$ncs; domain=$ncDom; last=(Fmt-Date $last); days=$days; error=$err })
+        }
+    }
+    # SYSVOL replication of this domain
+    $flRaw = $null; $dfsrGroup = $false
+    try { $gs = Get-ADObject ("CN=DFSR-GlobalSettings,CN=System," + $ddn) -Server $srv -Properties 'msDFSR-Flags' -ErrorAction Stop; $flRaw = $gs.'msDFSR-Flags' } catch {}
+    try { $null = Get-ADObject ("CN=Domain System Volume,CN=DFSR-GlobalSettings,CN=System," + $ddn) -Server $srv -ErrorAction Stop; $dfsrGroup = $true } catch {}
+    $sv = if ($null -ne $flRaw -and [int]$flRaw -eq 48) { @{ mode='DFSR'; state='Migrated from FRS (Eliminated state)'; sev='ok' } }
+          elseif ($dfsrGroup -and $null -eq $flRaw) { @{ mode='DFSR'; state='DFSR from the start'; sev='ok' } }
+          elseif ($null -ne $flRaw -and ([int]$flRaw -eq 16 -or [int]$flRaw -eq 32)) { @{ mode='FRS to DFSR migration'; state=$(if ([int]$flRaw -eq 16) { 'Prepared state - migration not finished' } else { 'Redirected state - migration not finished' }); sev='warn' } }
+          else { @{ mode='FRS'; state='SYSVOL is still replicated by FRS'; sev='crit' } }
+    $sv['domain'] = $dom
+    [void]$BK['sysvolDomains'].Add($sv)
+}
+# One SYSVOL line for the forest: the worst domain
+$svL = $BK['sysvolDomains']
+if ($svL.Count -eq 1) { $BK['sysvol'] = @{ mode=$svL[0]['mode']; state=$svL[0]['state']; sev=$svL[0]['sev'] } }
+elseif ($svL.Count -gt 1) {
+    $R = @{ crit=3; warn=2; info=1; ok=0 }; $worst = $null; $bad = 0
+    foreach ($x in $svL) { if ($x['sev'] -ne 'ok') { $bad++ }; if ($null -eq $worst -or $R[[string]$x['sev']] -gt $R[[string]$worst['sev']]) { $worst = $x } }
+    if ($bad -eq 0) { $BK['sysvol'] = @{ mode='DFSR'; state=('DFSR in all ' + $svL.Count + ' domains'); sev='ok' } }
+    else {
+        $more = ''; if ($bad -gt 1) { $more = ' and ' + ($bad - 1) + ' other domain(s)' }
+        $BK['sysvol'] = @{ mode=$worst['mode']; state=($worst['state'] + ' (' + $worst['domain'] + $more + ')'); sev=$worst['sev'] }
+    }
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Windows Server 2025 migration readiness
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host "[6/6] Windows Server 2025 readiness..." -ForegroundColor Yellow
-$W25 = @{ ffl=$null; dfl=$null; schema=$null; aesDate=''; dcs=[System.Collections.ArrayList]::new(); krbtgt=@{};
-          svcNoAes=[System.Collections.ArrayList]::new(); rc4Only=[System.Collections.ArrayList]::new();
-          usersNoAesCount=0; usersNoAes=[System.Collections.ArrayList]::new();
-          legacyComputers=[System.Collections.ArrayList]::new(); nonWindows=[System.Collections.ArrayList]::new();
-          exchange=[System.Collections.ArrayList]::new(); notes=[System.Collections.ArrayList]::new() }
-function Get-EncTxt { param($V)
-    if ($null -eq $V) { return 'not set' }
-    $t=[System.Collections.ArrayList]::new(); $v=[int64]$V
-    if ($v -band 1) { [void]$t.Add('DES-CRC') }; if ($v -band 2) { [void]$t.Add('DES-MD5') }; if ($v -band 4) { [void]$t.Add('RC4') }
-    if ($v -band 8) { [void]$t.Add('AES128') }; if ($v -band 16) { [void]$t.Add('AES256') }
-    if ($t.Count -eq 0) { return "0x{0:x}" -f $v }; return ($t -join ', ') }
+$W25 = @{ ffl=$null; dfl=$null; dfls=@{}; schema=$null; dcs=[System.Collections.ArrayList]::new(); exchange=[System.Collections.ArrayList]::new(); notes=[System.Collections.ArrayList]::new() }
 try {
     $root6 = Get-ADRootDSE -ErrorAction Stop
     $cfg6  = [string]$root6.configurationNamingContext
     try { $p = Get-ADObject ("CN=Partitions," + $cfg6) -Properties 'msDS-Behavior-Version' -ErrorAction Stop; $W25['ffl'] = [int]$p.'msDS-Behavior-Version' } catch { [void]$W25['notes'].Add('Forest functional level could not be read.') }
-    try { $dh = Get-ADObject $DomainDN -Properties 'msDS-Behavior-Version' -ErrorAction Stop; $W25['dfl'] = [int]$dh.'msDS-Behavior-Version' } catch { [void]$W25['notes'].Add('Domain functional level could not be read.') }
     try { $sc = Get-ADObject ([string]$root6.schemaNamingContext) -Properties objectVersion -ErrorAction Stop; $W25['schema'] = [int]$sc.objectVersion } catch {}
-    # Every DC in the forest (functional level 2016 needs all of them on 2016+)
-    $doms = @($DomainDNS); if ($Forest) { $doms = @($Forest.Domains) }
-    foreach ($dom in $doms) {
-        try {
-            foreach ($x in @(Get-ADDomainController -Filter * -Server ([string]$dom) -ErrorAction Stop)) {
-                $b = 0; try { $b = [int](([string]$x.OperatingSystemVersion) -replace '^.*\((\d+)\).*$','$1') } catch {}
-                [void]$W25['dcs'].Add(@{ name=[string]$x.HostName; domain=[string]$dom; os=[string]$x.OperatingSystem; build=$b; ok=[bool]($b -ge 14393) })
-            }
-        } catch { [void]$W25['notes'].Add("Domain controllers of $dom could not be listed: $($_.Exception.Message)") }
+    # Domain functional level of every domain; the lowest one is what blocks
+    foreach ($dom in $AllDomains) {
+        if (-not $DomInfo.ContainsKey($dom)) { continue }
+        try { $dh = Get-ADObject ([string]$DomInfo[$dom]['dn']) -Server $dom -Properties 'msDS-Behavior-Version' -ErrorAction Stop; $W25['dfls'][$dom] = [int]$dh.'msDS-Behavior-Version' }
+        catch { [void]$W25['notes'].Add("Domain functional level of $dom could not be read.") }
     }
-    # Date AES keys became available: creation of the "Read-only Domain Controllers" group (RID 521, added with the first 2008 schema)
-    $aesDate = $null
-    try { $rodcG = Get-ADGroup -Identity ([string]$Domain.DomainSID.Value + '-521') -Properties whenCreated -ErrorAction Stop; $aesDate = [datetime]$rodcG.whenCreated; $W25['aesDate'] = $aesDate.ToString('yyyy-MM-dd') }
-    catch { [void]$W25['notes'].Add('Could not determine when AES keys became available (Read-only Domain Controllers group not found); password-age checks skipped.') }
-    # krbtgt
-    try {
-        $k = Get-ADUser krbtgt -Properties PasswordLastSet,'msDS-SupportedEncryptionTypes' -ErrorAction Stop
-        $noAes = $false; if ($aesDate -and $k.PasswordLastSet -and ([datetime]$k.PasswordLastSet -lt $aesDate)) { $noAes = $true }
-        $W25['krbtgt'] = @{ last=(Fmt-Date $k.PasswordLastSet); noAes=$noAes; enc=(Get-EncTxt $k.'msDS-SupportedEncryptionTypes') }
-    } catch {}
-    # Users: service accounts (SPN) without AES keys, RC4-only encryption types, all users with pre-AES passwords
-    try {
-        $users = @(Get-ADUser -Filter 'Enabled -eq $true' -Properties PasswordLastSet,servicePrincipalName,'msDS-SupportedEncryptionTypes' -ErrorAction Stop)
-        foreach ($u in $users) {
-            $last = $u.PasswordLastSet; $hasSpn = [bool](@($u.servicePrincipalName).Count -gt 0 -and $u.servicePrincipalName)
-            $old = [bool]($aesDate -and $last -and ([datetime]$last -lt $aesDate))
-            $et = $u.'msDS-SupportedEncryptionTypes'
-            if ([string]$u.SamAccountName -eq 'krbtgt') { continue }
-            if ($old) {
-                $W25['usersNoAesCount'] = [int]$W25['usersNoAesCount'] + 1
-                if ($hasSpn) { [void]$W25['svcNoAes'].Add(@{ name=[string]$u.Name; sam=[string]$u.SamAccountName; last=(Fmt-Date $last) }) }
-                elseif ($W25['usersNoAes'].Count -lt 200) { [void]$W25['usersNoAes'].Add(@{ name=[string]$u.Name; sam=[string]$u.SamAccountName; last=(Fmt-Date $last) }) }
-            }
-            if ($null -ne $et) { $ev=[int64]$et; if (($ev -band 4) -and -not ($ev -band 24)) { [void]$W25['rc4Only'].Add(@{ name=[string]$u.Name; sam=[string]$u.SamAccountName; kind='user'; enc=(Get-EncTxt $ev) }) } }
-        }
-    } catch { [void]$W25['notes'].Add("User accounts could not be read: $($_.Exception.Message)") }
-    # Computers: legacy OS without AES, non-Windows systems, RC4-only encryption types
-    try {
-        $comps = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem,'msDS-SupportedEncryptionTypes' -ErrorAction Stop)
-        foreach ($c in $comps) {
-            $os = [string]$c.OperatingSystem
-            if ($os -match 'Windows (XP|2000|NT)|Windows Server 2003|Windows Server® 2003') { [void]$W25['legacyComputers'].Add(@{ name=[string]$c.Name; os=$os }) }
-            elseif ($os -and $os -notmatch 'Windows') { if ($W25['nonWindows'].Count -lt 300) { [void]$W25['nonWindows'].Add(@{ name=[string]$c.Name; os=$os }) } }
-            $et = $c.'msDS-SupportedEncryptionTypes'
-            if ($null -ne $et) { $ev=[int64]$et; if (($ev -band 4) -and -not ($ev -band 24)) { [void]$W25['rc4Only'].Add(@{ name=[string]$c.Name; sam=[string]$c.SamAccountName; kind='computer'; enc=(Get-EncTxt $ev) }) } }
-        }
-    } catch { [void]$W25['notes'].Add("Computer accounts could not be read: $($_.Exception.Message)") }
+    foreach ($v in @($W25['dfls'].Values)) { if ($null -eq $W25['dfl'] -or [int]$v -lt [int]$W25['dfl']) { $W25['dfl'] = [int]$v } }
+    # Every DC in the forest (functional level 2016 needs all of them on 2016+)
+    foreach ($dc in $DCS) { [void]$W25['dcs'].Add(@{ name=$dc['name']; domain=$dc['domain']; os=$dc['os']; build=$dc['build']; ok=[bool]([int]$dc['build'] -ge 14393) }) }
     # Exchange servers in the forest
     try {
-        $ex = @(Get-ADObject -SearchBase ("CN=Microsoft Exchange,CN=Services," + $cfg6) -LDAPFilter '(objectClass=msExchExchangeServer)' -Properties serialNumber -ErrorAction Stop)
+        $ex = @(Get-ADObject -SearchBase ("CN=Microsoft Exchange,CN=Services," + $cfg6) -LDAPFilter '(objectCategory=msExchExchangeServer)' -Properties serialNumber -ErrorAction Stop)
         foreach ($e in $ex) {
             $sn = [string](@($e.serialNumber)[0]); $ver=''
             if ($sn -match 'Version (\d+\.\d+)') { $ver = $Matches[1] }
@@ -622,7 +867,7 @@ try {
 } catch { [void]$W25['notes'].Add("Readiness checks failed: $($_.Exception.Message)") }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JSON: .NET JavaScriptSerializer (fast). PowerShell serializer = fallback.
+# JSON: own writer (handles PowerShell-wrapped values).
 # ─────────────────────────────────────────────────────────────────────────────
 function ConvertTo-JsonStr {
     param([string]$s)
@@ -661,19 +906,11 @@ function Write-JsonValue {
 Write-Host "Assembling report data..." -ForegroundColor Yellow
 $stage = 'summary'
 try {
-    $Summary = @{ domain=$DomainDNS; forest=$ForestDNS; generated=$GeneratedAt; pdc=$PdcName; dcs=$DCS; desOnly=$DesOnly; events=$EV; backup=$BK; w25=$W25 }
+    $Summary = @{ domain=$DomainDNS; forest=$ForestDNS; generated=$GeneratedAt; pdc=$RootPdc; domains=$AllDomains; pdcs=$PdcMap; domNotes=$DomNotes; dcs=$DCS; desOnly=$DesOnly; events=$EV; eventsByDomain=$EVByDomain; backup=$BK; w25=$W25; maxEvents=$MaxEventsPerDc }
     $stage = 'serialize'
     $DataJSON = $null
-    try {
-        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
-        $ser = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
-        $ser.MaxJsonLength = [int]::MaxValue; $ser.RecursionLimit = 256
-        $DataJSON = $ser.Serialize($Summary)
-        if ($DataJSON.Contains('"ImmediateBaseObject"')) { throw 'PowerShell wrapper detected in output' }
-    } catch {
-        Write-Host ("  .NET serializer unavailable ({0}) - using PowerShell fallback..." -f $_.Exception.Message) -ForegroundColor DarkYellow
-        $__jsb = [System.Text.StringBuilder]::new(); Write-JsonValue $Summary $__jsb; $DataJSON = $__jsb.ToString()
-    }
+    # Own JSON writer: the .NET JavaScriptSerializer can spend a very long time on PowerShell-wrapped values before failing
+    $__jsb = [System.Text.StringBuilder]::new(); Write-JsonValue $Summary $__jsb; $DataJSON = $__jsb.ToString()
     Write-Host ("  JSON size: {0} MB" -f [math]::Round($DataJSON.Length/1MB,2)) -ForegroundColor Gray
 } catch {
     Write-Host ""
@@ -685,7 +922,7 @@ Write-Host "Composing HTML..." -ForegroundColor Yellow
 $HTML = @"
 <!DOCTYPE html>
 <html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AD DC Posture - $DomainDNS</title>
+<title>AD DC Posture - $ForestDNS</title>
 <style>
 :root{
   --bg:#f5f6fb; --surface:#ffffff; --surface2:#eef1f9; --surface3:#dfe4f2; --border:#e4e7f2; --text:#161a2e; --muted:#64708c;
@@ -843,6 +1080,12 @@ table.tbl{width:100%;border-collapse:collapse;font-size:13px}
 .stitle{font-size:14.5px;font-weight:700;color:#fff;line-height:1.25;margin-top:2px}
 .smeta{font-size:11.5px;color:#8f95ba;line-height:1.45;padding:14px 8px;border-bottom:1px solid rgba(255,255,255,.08)}
 .smeta div{margin-bottom:8px}.smeta div:last-child{margin-bottom:0}.smeta b{display:block;color:#e6e8f5;font-weight:600;word-break:break-all;font-size:12px}
+.sdom{padding:14px 8px 4px}
+.sdom label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:#8a90b8;font-weight:700;margin-bottom:6px}
+.sdom select{width:100%;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.16);color:#fff;border-radius:9px;padding:9px 10px;font-size:13px;font-weight:600;font-family:var(--font);cursor:pointer;outline:none}
+.sdom select:hover{background:rgba(255,255,255,.12)}.sdom select:focus{border-color:#a5b4fc;box-shadow:0 0 0 3px rgba(99,102,241,.35)}
+.sdom select option{color:#161a2e;background:#fff}
+.dsub{display:block;font-size:11px;color:var(--muted);font-weight:400;margin-top:1px}
 .sgroup{font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:#6f76a3;font-weight:700;padding:18px 10px 8px}
 #secnav a{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:9px;font-size:13px;color:#c9cde6;cursor:pointer;font-weight:500;margin-bottom:2px;text-decoration:none;transition:background .15s}
 #secnav a:hover{background:rgba(255,255,255,.06);color:#fff}
@@ -918,10 +1161,35 @@ tr.tdet td{background:var(--surface)!important;padding:12px 16px 16px}
 .srclink{display:inline-flex;align-items:center;gap:6px;margin-top:14px;font-size:12.5px;font-weight:600;color:var(--accent);text-decoration:none}.srclink:hover{text-decoration:underline}
 .w25note{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:10px}
 .flash{animation:flash 1.2s ease}@keyframes flash{0%{box-shadow:0 0 0 4px var(--accent-soft)}100%{box-shadow:var(--shadow)}}
+.evgap{display:flex;gap:9px;align-items:flex-start;margin:0 18px 10px;padding:10px 13px;border-radius:9px;background:var(--amber-soft,#fff7e6);color:var(--text);font-size:13px;line-height:1.5}
+.evgap .ic{flex-shrink:0;margin-top:2px;color:var(--amber,#b45309)}
+.evgap:first-child{margin-top:14px}
+.evabout{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:10px 16px;border-bottom:1px solid var(--border);font-size:12.5px;color:var(--muted)}
+.evchip{font:600 12px/1 inherit;font-family:inherit;padding:5px 10px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--accent);cursor:pointer}
+.evchip:hover,.evchip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.evhint{margin-left:auto;font-size:12px}
+.evdesc{margin:12px 16px;padding:12px 14px;border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:8px;background:var(--surface2)}
+.evdt{font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:8px}
+.evid{font:700 11.5px/1 ui-monospace,Consolas,monospace;padding:3px 7px;border-radius:5px;background:var(--accent);color:#fff}
+.evdd{font-size:13px;line-height:1.55;margin:6px 0 8px}
+.evdm{display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between;font-size:12.5px;color:var(--muted)}
+.evdm a{color:var(--accent);font-weight:600;text-decoration:none}
+tr.evr{cursor:pointer}tr.evr:hover td{background:var(--surface2)}tr.evr.open td{background:var(--surface2)}
+tr.evdet>td{background:var(--surface2);padding:4px 0 8px!important}
+.evkvs{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px 18px;padding:10px 16px}
+.evkv .k{font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin-bottom:3px}
+.evkv .v{font-size:13px;word-break:break-word}.evkv ul{margin:0;padding-left:16px;max-height:180px;overflow:auto}
+tr.evdet .evdesc{margin:6px 16px}
+.evlbl{display:block;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin-bottom:2px}
+.evraw{margin-top:10px;border-top:1px solid var(--border);padding-top:8px}
+.evraw summary{cursor:pointer;font-size:12.5px;font-weight:600;color:var(--accent)}
+.evraw pre{margin:8px 0 0;padding:10px 12px;max-height:340px;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:6px;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:var(--text)}
+.evnoraw{margin-top:8px;font-size:12px;color:var(--muted)}
 </style></head><body>
 <aside class="side">
   <div class="sbrand"><div class="slogo"><i class="ic" data-i="key"></i></div><div><div class="skick">AD Audit Suite</div><div class="stitle">DC Posture</div></div></div>
   <div class="smeta" id="topmeta"></div>
+  <div class="sdom" id="sdomwrap" style="display:none"><label for="domsel">Domain</label><select id="domsel"></select></div>
   <div class="sgroup">Report</div>
   <nav id="secnav"></nav>
   <div class="sfoot"><button class="sbtn" id="themebtn"><i class="ic" data-i="moon"></i><span id="themetxt">Dark mode</span></button></div>
@@ -985,14 +1253,29 @@ function worstOf(l){var w='';l.forEach(function(s){if(s&&RANK[s]>RANK[w])w=s;});
 function tag(sev,txt){return '<span class="tag '+(sev==='crit'?'high':(sev==='warn'?'warn':(sev==='info'?'low':(sev==='ok'?'ok':'mut'))))+'">'+esc(txt)+'</span>';}
 function dl(name,rows){var csv='\ufeff'+rows.map(function(r){return r.map(function(c){c=(c==null?'':''+c);return '"'+c.replace(/"/g,'""')+'"';}).join(',');}).join('\r\n');var b=new Blob([csv],{type:'text/csv'});var u=URL.createObjectURL(b);var a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(u);}
 
+/* ---------------- domain selector: the report is rebuilt for one domain, without reloading the page ---------------- */
+var D0=D, DOMS=arr(D0.domains);
+function viewFor(sel){var X=JSON.parse(JSON.stringify(D0));if(!sel||DOMS.indexOf(sel)<0)return X;
+  var lc=sel.toLowerCase();function inD(x){return !!x&&(''+(x.domain||'')).toLowerCase()===lc;}
+  X.view=sel;X.domain=sel;X.pdc=(X.pdcs||{})[sel]||'';X.dcs=arr(X.dcs).filter(inD);X.desOnly=arr(X.desOnly).filter(inD);X.domNotes=[];
+  if(X.eventsByDomain&&X.eventsByDomain[sel])X.events=X.eventsByDomain[sel];
+  if(X.backup){X.backup.partitions=arr(X.backup.partitions).filter(function(q){return !q.domain||(''+q.domain).toLowerCase()===lc;});var sv=arr(X.backup.sysvolDomains).filter(inD)[0];if(sv)X.backup.sysvol={mode:sv.mode,state:sv.state,sev:sv.sev};}
+  if(X.w25){X.w25.dcs=arr(X.w25.dcs).filter(inD);var fl=(X.w25.dfls||{})[sel];X.w25.dfl=(fl==null?null:fl);var o={};if(fl!=null)o[sel]=fl;X.w25.dfls=o;}
+  return X;}
+</script>
+<script type="text/plain" id="app">
 var DCS=arr(D.dcs), EV=D.events||{}, BK=D.backup||{}, DES=arr(D.desOnly);
-qs('#topmeta').innerHTML='<div>Domain<b>'+esc(D.domain)+'</b></div><div>PDC emulator<b>'+esc(D.pdc)+'</b></div><div>Generated<b>'+esc(D.generated)+'</b></div>';
+var MULTI=DOMS.length>1, SHOWDOM=MULTI&&!D.view;
+function domSub(dc){return SHOWDOM&&dc.domain?'<span class="dsub">'+esc(dc.domain)+'</span>':'';}
+function dcWho(dc){return SHOWDOM&&dc.domain?dc.short+' ('+(''+dc.domain).split('.')[0]+')':dc.short;}
+qs('#topmeta').innerHTML=(SHOWDOM?'<div>Forest<b>'+esc(D.forest)+'</b></div><div>PDC emulator (forest root)<b>'+esc(D.pdc)+'</b></div>':'<div>Domain<b>'+esc(D.domain)+'</b></div><div>PDC emulator<b>'+esc(D.pdc)+'</b></div>')+'<div>Generated<b>'+esc(D.generated)+'</b></div>';
 qs('#themebtn').onclick=function(){var d=document.documentElement.getAttribute('data-theme')==='dark';document.documentElement.setAttribute('data-theme',d?'light':'dark');qs('#themetxt').textContent=d?'Dark mode':'Light mode';qs('#themebtn i').innerHTML=ICONS[d?'moon':'sun'];};
 
 /* ---------------- settings metadata ---------------- */
 var SET=[
  ['ldapSign','LDAP signing','Whether the domain controller requires LDAP clients to sign their binds. Unsigned binds can be intercepted and relayed.','Required'],
  ['ldapCbt','LDAP channel binding','Ties LDAPS sessions to the TLS channel so credentials cannot be relayed over LDAPS.','Always'],
+ ['ldapLog','LDAP client logging','LDAP interface event logging (NTDS Diagnostics, "16 LDAP Interface Events"). At level 2 the DC records the IP address and account of each client making an unsigned or clear-text bind (event 2889). Without it, only a daily count is logged (event 2887).','2 while finding unsigned clients, then 0; not needed once signing is required'],
  ['ldaps','LDAPS certificate','Tested from the machine that ran this report: port 636 and the certificate it presents.','Valid certificate, not expiring within 30 days'],
  ['ntlmLevel','NTLM level','LAN Manager authentication level (LmCompatibilityLevel). Below 5 the DC still accepts LM and NTLMv1.','5 - Send NTLMv2 only, refuse LM & NTLM'],
  ['ntlmAudit','NTLM auditing','Auditing or restricting NTLM in the domain shows which clients still depend on it.','Auditing enabled, then restriction'],
@@ -1007,6 +1290,27 @@ var SET=[
  ['kerbEnc','Kerberos encryption types','Encryption types the DC allows for Kerberos.','AES only'],
  ['spooler','Print Spooler','A running spooler on a DC enables authentication coercion attacks.','Stopped and disabled']];
 function dcSetting(dc,id){var r=null;arr(dc.settings).forEach(function(s){if(s.id===id)r=s;});return r;}
+function covDc(c){return c.dc+(SHOWDOM&&c.domain?' ('+(''+c.domain).split('.')[0]+')':'');}
+function covWho(fn){return arr(EV.oldCov).filter(fn).map(covDc);}
+var OLDGAP={
+ cbt:function(){var g=[],a=covWho(function(c){return c.known&&!(c.ldap>=2);}),u=covWho(function(c){return !c.known;});
+   if(a.length)g.push(['Not logged on '+a.join(', '),'Raise LDAP client logging to 2 on these domain controllers (see Protocols &rsaquo; LDAP client logging). Event 3039 is written at that level only.']);
+   if(u.length)g.push(['Not known on '+u.join(', '),'The settings of these domain controllers could not be read, so it is not known whether event 3039 is logged.']);return g;},
+ ntlm1:function(){var g=[],a=covWho(function(c){return c.n4624===false;}),k=covWho(function(c){return c.capNtlm1;});
+   if(a.length)g.push(['No logon event (4624) on '+a.join(', '),'Turn on success auditing for Audit Logon (Advanced Audit Policy &rsaquo; Logon/Logoff) for the domain controllers, and make the Security log large enough to cover the period.']);
+   if(k.length)g.push(['Limit reached on '+k.join(', '),'Only the newest '+(+D.maxEvents||5000)+' events were read on these domain controllers. Run the report with a higher -MaxEventsPerDc to see more.']);return g;},
+ weak:function(){var g=[],a=covWho(function(c){return c.n4769===false;}),k=covWho(function(c){return c.capWeak;});
+   if(a.length)g.push(['No Kerberos ticket event (4769) on '+a.join(', '),'Turn on success auditing for Audit Kerberos Authentication Service and Audit Kerberos Service Ticket Operations (Advanced Audit Policy &rsaquo; Account Logon) for the domain controllers.']);
+   if(k.length)g.push(['Limit reached on '+k.join(', '),'Only the newest '+(+D.maxEvents||5000)+' events were read on these domain controllers. Run the report with a higher -MaxEventsPerDc to see more.']);return g;},
+ ntlm:function(){var g=[],a=covWho(function(c){return c.ntlmFrom==='4776';}),z=covWho(function(c){return c.ntlmFrom==='4776'&&c.n4776===false;}),k=covWho(function(c){return c.capNtlm;});
+   if(a.length)g.push(['Workstation and account only on '+a.join(', '),'These domain controllers do not audit NTLM, so the list comes from event 4776. To also see the server each NTLM logon is for (event 8004), set "Network security: Restrict NTLM: Audit NTLM authentication in this domain" to "Enable all" on the domain controllers.']);
+   if(z.length)g.push(['Nothing recorded on '+z.join(', '),'Turn on success auditing for Audit Credential Validation (Advanced Audit Policy &rsaquo; Account Logon) for the domain controllers.']);
+   if(k.length)g.push(['Limit reached on '+k.join(', '),'Only the newest '+(+D.maxEvents||5000)+' events were read on these domain controllers, so this is a sample of recent NTLM use. Run the report with a higher -MaxEventsPerDc to see more.']);return g;},
+ smb1:function(){var g=[],o=covWho(function(c){return c.smb1Off===true;}),a=covWho(function(c){return c.known&&c.smb1Off!==true&&!(c.smb1Audit>=1);});
+   if(a.length)g.push(['Not audited on '+a.join(', '),'SMBv1 is enabled on these domain controllers but its use is not logged. Turn on SMBv1 access auditing in the SMB server configuration (AuditSmb1Access), then run the report again after a few days.']);
+   if(o.length)g.push(['Disabled on '+o.join(', '),'SMBv1 is off on these domain controllers, so no client can use it there.']);return g;}};
+function gapHtml(g){return g.map(function(x){return '<div class="evgap">'+ic('info')+'<span><b>'+esc(x[0])+'.</b> '+x[1]+'</span></div>';}).join('');}
+function logOff(){return DCS.filter(function(dc){var s=dcSetting(dc,'ldapLog');return s&&s.sev!=='ok';}).map(function(dc){return dcWho(dc);});}
 function roleTxt(dc){return (dc.isPdc?'PDC emulator':'Domain controller')+(dc.rodc?' (read-only)':'');}
 function offTxt(o){o=+o;return (o>=0?'+':'')+o.toFixed(3)+' s';}
 var TSL=BK.tombstone||180;
@@ -1016,9 +1320,9 @@ function partSev(p){if(p.error&&p.days==null)return 'info';if(p.days==null)retur
 var F={};
 function addF(sec,sev,title,advice,who){var k=sec+'|'+title;if(!F[k])F[k]={sec:sec,sev:sev,title:title,advice:advice,who:[]};var f=F[k];if(RANK[sev]>RANK[f.sev])f.sev=sev;if(!f.advice)f.advice=advice;if(who&&f.who.indexOf(who)<0)f.who.push(who);}
 DCS.forEach(function(dc){
-  arr(dc.settings).forEach(function(s){if(s.sev!=='ok')addF('proto',s.sev,s.title,s.advice,dc.short);});
-  arr((dc.time||{}).findings).forEach(function(t){addF('time',t.sev,t.title,t.advice,dc.short);});
-  if(!dc.regRead)addF('proto','info','Settings could not be read on some DCs','Run the report from a host that can reach these DCs over DCOM (or WinRM) with admin rights.',dc.short);
+  arr(dc.settings).forEach(function(s){if(s.sev!=='ok')addF('proto',s.sev,s.title,s.advice,dcWho(dc));});
+  arr((dc.time||{}).findings).forEach(function(t){addF('time',t.sev,t.title,t.advice,dcWho(dc));});
+  if(!dc.regRead)addF('proto','info','Settings could not be read on some DCs','Run the report from a host that can reach these DCs over DCOM (or WinRM) with admin rights.',dcWho(dc));
 });
 DES.forEach(function(a){addF('proto','crit','Accounts restricted to DES Kerberos','Clear "Use only Kerberos DES encryption types" on these accounts and reset their passwords so AES keys are created.',a.name);});
 if(EV.collected){
@@ -1026,7 +1330,14 @@ if(EV.collected){
   arr(EV.failSources).forEach(function(x){if(x.distinct>=10)addF('events','warn','Possible password spraying','Identify the source machine and investigate; consider blocking it and resetting passwords for targeted accounts.',x.name);});
   arr(EV.privChanges).forEach(function(c){addF('events','warn','Privileged group membership changed','Confirm each change was authorised.',c.member+' '+c.action+' '+(c.action==='added'?'to':'from')+' '+c.group);});
   arr(EV.cleared).forEach(function(c){addF('events','crit','Security log was cleared','Confirm who cleared the log and why; this is a common step to hide an intrusion.',c.dc);});
-  arr(EV.ldapDc).forEach(function(x){if(x.simple>0||x.unsignedSasl>0)addF('events','warn','Clients using unsigned or clear-text LDAP','Move these clients to LDAPS or signed binds, then require LDAP signing. Enable LDAP interface diagnostic logging to see each client (event 2889).',x.dc);});
+  arr(EV.ldapDc).forEach(function(x){if(x.simple>0||x.unsignedSasl>0)addF('events','warn','Clients using unsigned or clear-text LDAP','Move these clients to LDAPS or signed binds, then require LDAP signing.'+(logOff().length?' To see each client (event 2889), raise LDAP client logging to 2 on: '+logOff().join(', ')+'.':''),x.dc);});
+  arr(EV.cbtClients).forEach(function(x){addF('events','warn','LDAPS clients without channel binding','Update these clients so they support LDAP channel binding before setting it to Always on the domain controllers.',x.name);});
+  arr(EV.ntlm1Clients).forEach(function(x){addF('events','warn','Clients using NTLMv1','NTLMv1 is removed in Windows Server 2025. Move these clients and applications to NTLMv2 or Kerberos, then refuse LM and NTLMv1 on the domain controllers.',x.name);});
+  arr(EV.weakClients).forEach(function(x){addF('events','warn','Kerberos tickets issued with RC4 or DES','Find why each client or service still gets RC4 or DES tickets (accounts without AES keys, services limited to RC4, old clients) and fix it before allowing AES only.',x.name);});
+  arr(EV.smb1Clients).forEach(function(x){addF('events','warn','Clients using SMBv1','Update or replace these clients, then remove SMB 1.0 from the domain controllers.',x.name);});
+  if(arr(EV.ntlmClients).length)addF('events','info','NTLM still in use','Review the computers that still use NTLM before restricting it in the domain; most can use Kerberos once they connect by DNS name to servers with the right SPNs.',plural(arr(EV.ntlmClients).length,'computer'));
+  (function(){var w={};['cbt','ntlm1','weak','ntlm','smb1'].forEach(function(k){OLDGAP[k]().forEach(function(g){if(/^(Not logged|No |Not audited|Nothing recorded)/.test(g[0]))w[g[0].replace(/^.* on /,'')]=1;});});
+    Object.keys(w).forEach(function(k){k.split(', ').forEach(function(dc){addF('events','info','Old-protocol use not fully logged','See Security events: each list says what to turn on and on which domain controllers.',dc);});});})();
   arr(EV.failed).forEach(function(f){addF('events','info','Event logs could not be read on some DCs','Check RPC access and Event Log Readers rights from the host running the report.',f.dc);});
 }
 var rbSev=BK.recycleBin===false?'info':(BK.recycleBinEnabled?'ok':'warn');
@@ -1057,10 +1368,15 @@ var W25C=CHK; /* kept for compatibility */
   if(!D.w25)return;
   /* ===== Windows Server 2025 readiness: Microsoft-documented requirements only ===== */
   CURG='w25'; CURS=MS.whatsnew;
-  [['Forest functional level',W.ffl,'forest'],['Domain functional level',W.dfl,'domain']].forEach(function(x){
+  var DFL=W.dfls||{},DK=Object.keys(DFL).sort();
+  [['Forest functional level',W.ffl,'forest',[]],['Domain functional level',W.dfl,'domain',DK.length>1?DK:[]]].forEach(function(x){
+    var many=x[3].length>1,cols=many?['Domain','Functional level','Status']:[],rows=x[3].map(function(d){return [d,flTxt(DFL[d]),DFL[d]>=7?tag('ok','supported'):tag('crit','too low')];});
+    var res=flTxt(x[1])+(many?', lowest of '+x[3].length+' domains':'');
     if(x[1]==null)wc('info',x[0],'Could not be read','Check the functional level manually before planning the migration.',[],[]);
-    else if(x[1]>=7)wc('ok',x[0],flTxt(x[1]),'',[],[]);
-    else wc('crit',x[0]+' too low',flTxt(x[1])+' (2016 required)','Microsoft requires the '+x[2]+' functional level to be Windows Server 2016 or later before a Windows Server 2025 domain controller can be promoted. Raising it first requires every domain controller in the '+x[2]+' to run Windows Server 2016 or later.',[],[]);});
+    else if(x[1]>=7)wc('ok',x[0],res,'',cols,rows);
+    else{var adv='Microsoft requires the '+x[2]+' functional level to be Windows Server 2016 or later before a Windows Server 2025 domain controller can be promoted. Raising it first requires every domain controller in the '+x[2]+' to run Windows Server 2016 or later.';
+      wc('crit',x[0]+' too low',res+' (2016 required)',adv,cols,rows,'',many);
+      if(many)x[3].forEach(function(d){if(DFL[d]<7)addF('w25','crit',x[0]+' too low',adv,d);});}});
   CURS=MS.fl;
   var dcs=arr(W.dcs), bad=dcs.filter(function(d){return !d.ok;});
   var osCount={};dcs.forEach(function(d){osCount[d.os]=(osCount[d.os]||0)+1;});
@@ -1117,7 +1433,9 @@ Array.prototype.forEach.call(document.querySelectorAll('.kpi.clickable'),functio
   var K=KPIS.filter(function(x){return x.k===curK;})[0];
   qs('#fbanner').innerHTML='<div class="filter-banner"><div class="filter-banner-head">'+ic(K.icon)+K.lbl+' ('+K.list.length+')<button class="mini-btn" onclick="document.querySelector(\'.kpi.active\').click()">'+ic('x')+'Close</button></div><div class="fb-list">'+
     (K.list.length?K.list.map(function(f){return '<div class="fb-row" onclick="jump(\''+f.sec+'\')"><span class="dot '+SEVMAP[f.sev]+'"></span><span class="nm">'+esc(f.title)+'</span><span class="cx">'+esc(SECNAME[f.sec])+'</span><span class="cx">'+plural(f.who.length,'item')+'</span></div>';}).join(''):'<div class="muted-note">Nothing in this category.</div>')+'</div></div>';};});
-if(DCS.some(function(d){return !d.regRead;}))qs('#coverage').innerHTML='<div class="banner-note">'+ic('alert')+'Settings could not be read on '+DCS.filter(function(d){return !d.regRead;}).map(function(d){return esc(d.short);}).join(', ')+' (remote management not reachable). Those DCs are listed but only partially assessed.</div>';
+(function(){var h='';if(arr(D.domNotes).length)h+='<div class="banner-note">'+ic('alert')+arr(D.domNotes).map(esc).join(' &middot; ')+'</div>';
+  if(DCS.some(function(d){return !d.regRead;}))h+='<div class="banner-note">'+ic('alert')+'Settings could not be read on '+DCS.filter(function(d){return !d.regRead;}).map(function(d){return esc(dcWho(d));}).join(', ')+' (remote management not reachable). Those DCs are listed but only partially assessed.</div>';
+  qs('#coverage').innerHTML=h;})();
 
 /* ---------------- priority findings ---------------- */
 var CHEV='<svg class="cv" viewBox="0 0 16 16" fill="currentColor"><path d="M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708"/></svg>';
@@ -1138,17 +1456,55 @@ function renderSetList(){var q=(qs('#setq').value||'').toLowerCase();
   qs('#setlist').innerHTML=items.join('');}
 function selSet(id){setSel=id;renderSetList();var h;
   if(id==='des'){h='<div class="detail-head"><div class="detail-title"><span class="dot '+(DES.length?'high':'ok')+'"></span>DES-only accounts</div><div class="detail-sub">Accounts flagged "Use only Kerberos DES encryption types"</div></div><div class="detail-body">'+
-    (DES.length?'<div class="dsec"><div class="dsec-t">Accounts</div><div class="tbl-wrap"><table class="tbl"><tr><th>Name</th><th>Account</th></tr>'+DES.map(function(a){return '<tr><td>'+esc(a.name)+'</td><td class="mono">'+esc(a.sam)+'</td></tr>';}).join('')+'</table></div></div><div class="dsec"><div class="dsec-t">Recommendation</div><div class="findings">'+findingHtml({sec:'proto',sev:'crit',title:'Remove DES',advice:'Clear "Use only Kerberos DES encryption types" on these accounts and reset their passwords so AES keys are created.',who:[]})+'</div></div>':'<div class="no-findings">'+ic('check')+'No accounts are restricted to DES.</div>')+'</div>';
+    (DES.length?'<div class="dsec"><div class="dsec-t">Accounts</div><div class="tbl-wrap"><table class="tbl"><tr><th>Name</th><th>Account</th>'+(SHOWDOM?'<th>Domain</th>':'')+'</tr>'+DES.map(function(a){return '<tr><td>'+esc(a.name)+'</td><td class="mono">'+esc(a.sam)+'</td>'+(SHOWDOM?'<td>'+esc(a.domain||'')+'</td>':'')+'</tr>';}).join('')+'</table></div></div><div class="dsec"><div class="dsec-t">Recommendation</div><div class="findings">'+findingHtml({sec:'proto',sev:'crit',title:'Remove DES',advice:'Clear "Use only Kerberos DES encryption types" on these accounts and reset their passwords so AES keys are created.',who:[]})+'</div></div>':'<div class="no-findings">'+ic('check')+'No accounts are restricted to DES.</div>')+'</div>';
     qs('#setdetail').innerHTML=h;return;}
   var m=SET.filter(function(x){return x[0]===id;})[0], st=setStats(id);
   var advs={};st.bad.forEach(function(x){if(x.s.advice)advs[x.s.advice]=x.s;});
   h='<div class="detail-head"><div class="detail-title"><span class="dot '+(SEVMAP[st.w]||'ok')+'"></span>'+esc(m[1])+'</div><div class="detail-sub">'+esc(m[2])+'</div></div><div class="detail-body">'+
     '<div class="dsec"><div class="kv-grid"><div class="kv"><div class="k">Recommended</div><div class="v">'+esc(m[3])+'</div></div><div class="kv"><div class="k">Domain controllers</div><div class="v '+(st.bad.length?'warn':'good')+'">'+(st.list.length?(st.bad.length?st.bad.length+' of '+st.list.length+' not as recommended':'All as recommended'):'Not read')+'</div></div></div></div>'+
-    (st.list.length?'<div class="dsec"><div class="dsec-t">Per domain controller</div><div class="tbl-wrap"><table class="tbl"><tr><th>DC</th><th>Value</th><th>Status</th></tr>'+st.list.map(function(x){return '<tr><td><b>'+esc(x.dc.short)+'</b></td><td class="mono">'+esc(x.s.value)+'</td><td>'+tag(x.s.sev,x.s.sev==='ok'?'OK':SEVWORD[x.s.sev])+'</td></tr>';}).join('')+'</table></div></div>':'')+
+    (st.list.length?'<div class="dsec"><div class="dsec-t">Per domain controller</div><div class="tbl-wrap"><table class="tbl"><tr><th>DC</th><th>Value</th><th>Status</th></tr>'+st.list.map(function(x){return '<tr><td><b>'+esc(x.dc.short)+'</b>'+domSub(x.dc)+'</td><td class="mono">'+esc(x.s.value)+'</td><td>'+tag(x.s.sev,x.s.sev==='ok'?'OK':SEVWORD[x.s.sev])+'</td></tr>';}).join('')+'</table></div></div>':'')+
     (Object.keys(advs).length?'<div class="dsec"><div class="dsec-t">Recommendation</div><div class="findings">'+Object.keys(advs).map(function(a){var s=advs[a];return findingHtml({sec:'proto',sev:s.sev,title:s.title,advice:a,who:[]});}).join('')+'</div></div>':'')+'</div>';
   qs('#setdetail').innerHTML=h;}
 qs('#setq').addEventListener('input',renderSetList);
 renderSetList();(function(){var first=SET.map(function(m){return {id:m[0],st:setStats(m[0])};}).sort(function(a,b){return RANK[b.st.w||'ok']-RANK[a.st.w||'ok'];})[0];selSet(first?first.id:'ldapSign');})();
+
+/* ---------------- event descriptions (click an event ID or a row) ---------------- */
+var MSEV='https://learn.microsoft.com/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-';
+var EVD={
+ 4740:['A user account was locked out','Logged on the domain controller that processed the lockout, usually the PDC emulator. "Caller Computer Name" is the computer the bad password attempts came from.','Audit User Account Management (success)',MSEV+'4740'],
+ 4625:['An account failed to log on','Logged by the computer where the logon was attempted, here the domain controllers. Gives the account, the reason (status code), the logon type and the source address or workstation.','Audit Logon (failure)',MSEV+'4625'],
+ 4771:['Kerberos pre-authentication failed','Logged on the domain controller when a Kerberos logon fails before a ticket is issued, most often a wrong password (failure code 0x18). Gives the account and the client address.','Audit Kerberos Authentication Service (failure)',MSEV+'4771'],
+ 4728:['A member was added to a security-enabled global group','Logged on the domain controller that made the change, with the member, the group and who made the change.','Audit Security Group Management (success)',MSEV+'4728'],
+ 4732:['A member was added to a security-enabled local group','Logged on the domain controller that made the change, with the member, the group and who made the change. Built-in groups such as Administrators are domain local groups.','Audit Security Group Management (success)',MSEV+'4732'],
+ 4756:['A member was added to a security-enabled universal group','Logged on the domain controller that made the change, with the member, the group and who made the change. Enterprise Admins and Schema Admins are universal groups.','Audit Security Group Management (success)',MSEV+'4756'],
+ 4729:['A member was removed from a security-enabled global group','Logged on the domain controller that made the change, with the member, the group and who made the change.','Audit Security Group Management (success)',MSEV+'4729'],
+ 4733:['A member was removed from a security-enabled local group','Logged on the domain controller that made the change, with the member, the group and who made the change.','Audit Security Group Management (success)',MSEV+'4733'],
+ 4757:['A member was removed from a security-enabled universal group','Logged on the domain controller that made the change, with the member, the group and who made the change.','Audit Security Group Management (success)',MSEV+'4757'],
+ 1102:['The audit log was cleared','Logged whenever the Security log is cleared, with the account that cleared it. Always written, whatever the audit policy.','Always logged',MSEV+'1102'],
+ 2887:['Unsigned and clear-text LDAP binds in the last 24 hours','Logged once a day by a domain controller that does not require LDAP signing, with the number of unsigned SASL binds and simple binds without SSL/TLS it accepted. No client details.','Logged by default (Directory Service log)','https://support.microsoft.com/help/4520412'],
+ 2889:['An LDAP client made an unsigned or clear-text bind','One event per bind, in the Directory Service log, with the client IP address and port, the account, and the bind type (0 = unsigned SASL, 1 = simple bind without SSL/TLS).','LDAP client logging (16 LDAP Interface Events) at 2','https://support.microsoft.com/help/4520412'],
+ 3039:['An LDAPS client did not provide a channel binding token','Logged in the Directory Service log when a client binds over LDAPS without channel binding, so it would be rejected once LDAP channel binding is set to Always. Gives the client IP address and the account.','LDAP client logging (16 LDAP Interface Events) at 2','https://support.microsoft.com/help/4520412'],
+ 4624:['An account was successfully logged on','Logged by the computer being logged on to. "Authentication Package" shows NTLM or Kerberos, and "Package Name (NTLM only)" shows NTLM V1 or NTLM V2. Gives the account, the workstation name and the source address.','Audit Logon (success)',MSEV+'4624'],
+ 4768:['A Kerberos authentication ticket (TGT) was requested','Logged on the domain controller at each Kerberos logon. "Ticket Encryption Type" 0x17 or 0x18 means RC4, 0x1 or 0x3 means DES, 0x11 or 0x12 means AES. Gives the account and the client address.','Audit Kerberos Authentication Service (success)',MSEV+'4768'],
+ 4769:['A Kerberos service ticket was requested','Logged on the domain controller each time a client asks for a ticket to a service. The ticket encryption type shows whether RC4 or DES was used for that service. Gives the account, the service and the client address.','Audit Kerberos Service Ticket Operations (success)',MSEV+'4769'],
+ 8004:['NTLM authentication processed by the domain controller','Logged in the Microsoft-Windows-NTLM/Operational log of the domain controller for each NTLM authentication it validates, with the account, the client workstation and the server that passed the request on (secure channel name).','Network security: Restrict NTLM: Audit NTLM authentication in this domain','https://learn.microsoft.com/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/network-security-restrict-ntlm-audit-ntlm-authentication-in-this-domain'],
+ 4776:['The domain controller attempted to validate the credentials for an account','Logged on the domain controller for each NTLM credential validation, with the account and the client workstation name. It does not show the IP address or the NTLM version.','Audit Credential Validation (success)',MSEV+'4776'],
+ 3000:['SMB1 access','Logged in the Microsoft-Windows-SMBServer/Audit log when a client connects with SMBv1, with the client address.','SMBv1 access auditing (AuditSmb1Access)','https://learn.microsoft.com/windows-server/storage/file-server/troubleshoot/detect-enable-and-disable-smbv1-v2-v3']};
+var EVIDS={lock:[4740],fsrc:[4625],facc:[4625],kerb:[4771],priv:[4728,4732,4756,4729,4733,4757],clear:[1102],ldap:[2887,2889],cbt:[3039],ntlm1:[4624],weak:[4768,4769],ntlm:[8004,4776],smb1:[3000]};
+function evDescHtml(id,open){var d=EVD[id];if(!d)return '';var sm=(EV.samples||{})[id];
+  return '<div class="evdesc"><div class="evdt"><span class="evid">'+id+'</span>'+esc(d[0])+'</div><div class="evdd"><span class="evlbl">In this report</span>'+esc(d[1])+'</div><div class="evdm"><span><b>Logged when:</b> '+esc(d[2])+'</span><a href="'+d[3]+'" target="_blank" rel="noopener">Microsoft documentation &rarr;</a></div>'+
+    (sm&&sm.msg?'<details class="evraw"'+(open?' open':'')+'><summary>Event text, as Windows wrote it on '+esc(sm.dc)+(sm.time?' ('+esc(sm.time)+')':'')+'</summary><pre>'+esc(sm.msg)+'</pre></details>'
+      :'<div class="evnoraw">No example of this event\'s text in this report: none was found in the period, or its text could not be read.</div>')+'</div>';}
+function evAbout(id,btn){var box=qs('#evdesc'),on=btn.classList.contains('on');
+  Array.prototype.forEach.call(document.querySelectorAll('.evchip'),function(b){b.classList.remove('on');});
+  if(on){box.innerHTML='';return;}btn.classList.add('on');box.innerHTML=evDescHtml(id,true);}
+function evRow(tr,ri){var nx=tr.nextElementSibling;if(nx&&nx.classList.contains('evdet')){nx.parentNode.removeChild(nx);tr.classList.remove('open');return;}
+  var c=EVC[EVCUR],x=c.rows[ri],v=c.csv(x),n=c.cols.length;tr.classList.add('open');
+  var kv=c.cols.map(function(h,i){var val=''+(v[i]==null?'':v[i]);var parts=val.split(' | ');
+    return '<div class="evkv"><div class="k">'+h+'</div><div class="v">'+(parts.length>1?'<ul>'+parts.map(function(p){return '<li>'+esc(p)+'</li>';}).join('')+'</ul>':esc(val||'-'))+'</div></div>';}).join('');
+  var d=document.createElement('tr');d.className='evdet';
+  d.innerHTML='<td colspan="'+n+'"><div class="evkvs">'+kv+'</div>'+(x.id?[x.id]:arr(EVIDS[c.k])).map(evDescHtml).join('')+'</td>';
+  tr.parentNode.insertBefore(d,tr.nextSibling);}
 
 /* ---------------- security events: one table, filtered by category ---------------- */
 function panel(icon,title,sub,body,csv){return '<div class="panel-card"><div class="panel-head">'+ic(icon)+title+(sub?' <span class="sub">'+sub+'</span>':'')+(csv?'<button class="mini-btn" onclick="'+csv+'">'+ic('download')+'CSV</button>':'')+'</div>'+body+'</div>';}
@@ -1182,10 +1538,27 @@ var EVC=[];
     cols:['When','DC','Cleared by'],cell:function(c){return [esc(c.time),'<b>'+esc(c.dc)+'</b>',esc(c.by)];},
     csv:function(c){return [c.time,c.dc,c.by];},num:[],sev:function(){return 'crit';}},
    {k:'ldap',label:'Unsigned / clear-text LDAP',sub:'Events 2887 / 2889 &middot; clients that will break when LDAP signing is required',rows:arr(EV.ldapClients),
-    note:ld.length?('Last 24-hour summary: '+ld.map(function(x){return '<b>'+esc(x.dc)+'</b> '+x.simple+' simple / '+x.unsignedSasl+' unsigned SASL binds';}).join(' &middot; ')+(arr(EV.ldapClients).length?'':' &mdash; per-client events (2889) appear only when LDAP interface diagnostic logging is raised on the DCs.')):'',
+    note:ld.length?('Last 24-hour summary: '+ld.map(function(x){return '<b>'+esc(x.dc)+'</b> '+x.simple+' simple / '+x.unsignedSasl+' unsigned SASL binds';}).join(' &middot; ')+(logOff().length?' &mdash; per-client events (2889) are not logged on '+esc(logOff().join(', '))+': LDAP client logging is off there (see Protocols).':'')):'',
     extra:ld.length,
     cols:['Client (account)','Binds','Bind type','Domain controllers','Last'],cell:function(x){return ['<b>'+esc(x.name)+'</b>',x.count,othTxt(x),esc(arr(x.dcs).join(', ')),esc(x.last)];},
-    csv:function(x){return [x.name,x.count,othCsv(x),arr(x.dcs).join(' | '),x.last];},num:[1],sev:function(){return 'warn';}}];
+    csv:function(x){return [x.name,x.count,othCsv(x),arr(x.dcs).join(' | '),x.last];},num:[1],sev:function(){return 'warn';}},
+   {k:'cbt',label:'LDAP channel binding',sub:'Event 3039 &middot; LDAPS clients that will fail when channel binding is set to Always',rows:arr(EV.cbtClients),gap:OLDGAP.cbt(),
+    cols:['Client','Binds','Accounts','Domain controllers','Last'],cell:function(x){return ['<b>'+esc(x.name)+'</b>',x.count,othTxt(x),esc(arr(x.dcs).join(', ')),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,othCsv(x),arr(x.dcs).join(' | '),x.last];},num:[1],sev:function(){return 'warn';}},
+   {k:'ntlm1',label:'NTLMv1 logons',sub:'Event 4624 (NTLM V1) &middot; removed in Windows Server 2025',rows:arr(EV.ntlm1Clients),gap:OLDGAP.ntlm1(),
+    pre:'Event 4624 is written by the server being logged on to: these are NTLMv1 logons to the domain controllers. NTLMv1 logons to other servers are in their own Security logs.',
+    cols:['Source','Logons','Accounts','Domain controllers','Last'],cell:function(x){return ['<b>'+esc(x.name)+'</b>',x.count,othTxt(x),esc(arr(x.dcs).join(', ')),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,othCsv(x),arr(x.dcs).join(' | '),x.last];},num:[1],sev:function(){return 'warn';}},
+   {k:'weak',label:'RC4 / DES Kerberos tickets',sub:'Events 4768 / 4769 &middot; clients and services that will break when only AES is allowed',rows:arr(EV.weakClients),gap:OLDGAP.weak(),
+    cols:['Client','Tickets','Encryption: account &gt; service','Domain controllers','Last'],cell:function(x){return ['<b>'+esc(x.name)+'</b>',x.count,othTxt(x),esc(arr(x.dcs).join(', ')),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,othCsv(x),arr(x.dcs).join(' | '),x.last];},num:[1],sev:function(){return 'warn';}},
+   {k:'ntlm',label:'NTLM authentications',sub:'Events 8004 / 4776 &middot; computers still using NTLM (workstation names, no IP)',rows:arr(EV.ntlmClients),gap:OLDGAP.ntlm(),
+    cols:['Workstation','Authentications','Accounts (&gt; server)','Domain controllers','Last'],cell:function(x){return ['<b>'+esc(x.name)+'</b>',x.count,othTxt(x),esc(arr(x.dcs).join(', ')),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,othCsv(x),arr(x.dcs).join(' | '),x.last];},num:[1],sev:function(){return '';}},
+   {k:'smb1',label:'SMBv1 clients',sub:'Event 3000 &middot; clients connecting to the domain controllers with SMBv1',rows:arr(EV.smb1Clients),gap:OLDGAP.smb1(),
+    cols:['Client','Connections','Domain controllers','Last'],cell:function(x){return ['<b>'+esc(x.name)+'</b>',x.count,esc(arr(x.dcs).join(', ')),esc(x.last)];},
+    csv:function(x){return [x.name,x.count,arr(x.dcs).join(' | '),x.last];},num:[1],sev:function(){return 'warn';}}];
+  EVC.forEach(function(c){if(c.gap&&c.gap.length&&!c.extra)c.extra=c.gap.length;});
   var h='';
   if(arr(EV.failed).length)h+='<div class="banner-note">'+ic('alert')+'Not read on: '+arr(EV.failed).map(function(f){return esc(f.dc)+' ('+esc(f.reason)+')';}).join(', ')+'</div>';
   h+='<div class="evcats">'+EVC.map(function(c,i){var n=c.rows.length, w=worstOf(c.rows.map(c.sev));
@@ -1200,11 +1573,12 @@ var EVCUR=0;
 function showEv(i){EVCUR=i;var c=EVC[i];
   Array.prototype.forEach.call(document.querySelectorAll('.evcat'),function(b){b.classList.toggle('on',+b.getAttribute('data-i')===i);});
   qs('#evhead').innerHTML=ic('journal')+'<span>'+esc(c.label)+'</span><span class="sub">'+c.sub+'</span>'+(c.rows.length?'<button class="mini-btn" onclick="csvEv()">'+ic('download')+'CSV</button>':'');
-  var body=(c.note?'<div class="evnote">'+c.note+'</div>':'');
-  if(!c.rows.length){body+='<div class="panel-body"><div class="no-findings">'+ic('check')+'Nothing recorded in this period.</div></div>';}
+  var body='<div class="evabout"><span>About the events:</span>'+arr(EVIDS[c.k]).map(function(id){return '<button class="evchip" onclick="evAbout('+id+',this)" title="'+esc(EVD[id]?EVD[id][0]:'')+'">'+id+'</button>';}).join('')+'<span class="evhint">Click a row for its details</span></div><div id="evdesc"></div>'+(c.note?'<div class="evnote">'+c.note+'</div>':'')+(c.pre?'<div class="evnote">'+esc(c.pre)+'</div>':'')+(c.gap&&c.gap.length?gapHtml(c.gap):'');
+  var blind=c.gap&&c.gap.some(function(g){return !/^Disabled on /.test(g[0]);});
+  if(!c.rows.length){body+='<div class="panel-body"><div class="no-findings">'+ic(blind?'info':'check')+(blind?'Nothing recorded in this period on the domain controllers that log it.':'Nothing recorded in this period.')+'</div></div>';}
   else{var LIM=10;
     body+='<div class="tbl-wrap"><table class="tbl"><tr>'+c.cols.map(function(h,ci){return '<th'+(c.num.indexOf(ci)>=0?' style="text-align:right"':'')+'>'+h+'</th>';}).join('')+'</tr>'+
-      c.rows.map(function(x,ri){var cells=c.cell(x);return '<tr'+(ri>=LIM?' class="rowhide evx"':'')+'>'+cells.map(function(v,ci){return '<td'+(c.num.indexOf(ci)>=0?' class="num"':'')+'>'+v+'</td>';}).join('')+'</tr>';}).join('')+'</table></div>'+
+      c.rows.map(function(x,ri){var cells=c.cell(x);return '<tr class="evr'+(ri>=LIM?' rowhide evx':'')+'" onclick="evRow(this,'+ri+')">'+cells.map(function(v,ci){return '<td'+(c.num.indexOf(ci)>=0?' class="num"':'')+'>'+v+'</td>';}).join('')+'</tr>';}).join('')+'</table></div>'+
       (c.rows.length>LIM?'<button class="tmore" onclick="Array.prototype.forEach.call(document.querySelectorAll(\'.evx\'),function(e){e.classList.remove(\'rowhide\');});this.style.display=\'none\';">Show '+(c.rows.length-LIM)+' more</button>':'');}
   qs('#evbody').innerHTML=body;}
 function csvEv(){var c=EVC[EVCUR];var rows=[c.cols];c.rows.forEach(function(x){rows.push(c.csv(x));});dl('events_'+c.k+'.csv',rows);}
@@ -1263,7 +1637,7 @@ renderBoard('w25');
     var read=!!(t.type||t.source);
     var st=!read?tag('','not read'):(f.length?f.map(function(x){return '<div class="tiss"><span class="dot '+SEVMAP[x.sev]+'"></span>'+esc(x.title)+'</div>';}).join(''):tag('ok','OK'));
     var typ=esc(t.type||'-')+(t.cfgBy==='Group Policy'?' '+tag('info','GPO'):'');
-    var main='<tr class="trow" onclick="var d=this.nextElementSibling;var o=d.style.display===\'none\';d.style.display=o?\'\':\'none\';this.classList.toggle(\'open\',o);"><td style="white-space:nowrap"><b>'+esc(dc.short)+'</b>'+(dc.isPdc?' '+tag('info','PDC'):'')+'</td><td>'+esc(dc.platform||'Unknown')+'</td><td>'+typ+'</td><td class="mono">'+esc(t.source||t.error||'-')+'</td><td style="white-space:nowrap">'+esc(t.lastSync||'-')+'</td><td class="num">'+(t.offsetPdc==null||dc.isPdc?'':offTxt(t.offsetPdc))+'</td><td>'+st+'</td><td style="width:22px">'+CHEV+'</td></tr>';
+    var main='<tr class="trow" onclick="var d=this.nextElementSibling;var o=d.style.display===\'none\';d.style.display=o?\'\':\'none\';this.classList.toggle(\'open\',o);"><td style="white-space:nowrap"><b>'+esc(dc.short)+'</b>'+(dc.isPdc?' '+tag('info','PDC'):'')+domSub(dc)+'</td><td>'+esc(dc.platform||'Unknown')+'</td><td>'+typ+'</td><td class="mono">'+esc(t.source||t.error||'-')+'</td><td style="white-space:nowrap">'+esc(t.lastSync||'-')+'</td><td class="num">'+(t.offsetPdc==null||dc.isPdc?'':offTxt(t.offsetPdc))+'</td><td>'+st+'</td><td style="width:22px">'+CHEV+'</td></tr>';
     var kv='<div class="kv-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:'+(f.length?'12px':'0')+'">'+
       '<div class="kv"><div class="k">NTP server</div><div class="v mono" style="font-size:12px">'+esc(t.ntpServer||'-')+'</div></div>'+
       '<div class="kv"><div class="k">Configured by</div><div class="v">'+esc(t.cfgBy||'-')+'</div></div>'+
@@ -1272,7 +1646,7 @@ renderBoard('w25');
     var det='<tr class="tdet" style="display:none"><td colspan="8">'+kv+(f.length?'<div class="findings">'+f.map(function(x){return findingHtml({sec:'time',sev:x.sev,title:x.title,advice:x.advice,who:[]});}).join('')+'</div>':'')+'</td></tr>';
     return main+det;}).join('');
   var fl=FL.filter(function(f){return f.sec==='time';});
-  qs('#time').innerHTML=panel('clock','Domain controllers','The PDC emulator should sync from reliable external NTP; every other DC follows the domain hierarchy. Click a DC for details.','<div class="tbl-wrap"><table class="tbl"><tr><th>DC</th><th>Platform</th><th>Type</th><th>Current source</th><th>Last sync</th><th>Offset vs PDC</th><th>Issues</th><th></th></tr>'+rows+'</table></div>')+
+  qs('#time').innerHTML=panel('clock','Domain controllers',(MULTI?'The PDC emulator of the forest root domain should sync from reliable external NTP; every other DC, including the PDC of each child domain, follows the domain hierarchy. Offsets are measured against the PDC of each DC&rsquo;s own domain.':'The PDC emulator should sync from reliable external NTP; every other DC follows the domain hierarchy.')+' Click a DC for details.','<div class="tbl-wrap"><table class="tbl"><tr><th>DC</th><th>Platform</th><th>Type</th><th>Current source</th><th>Last sync</th><th>Offset vs PDC</th><th>Issues</th><th></th></tr>'+rows+'</table></div>')+
     (anyVm?'<div class="banner-note" style="margin-bottom:12px">'+ic('info')+'VMware domain controllers: make sure VMware Tools periodic time synchronization is turned off, so the host does not fight the Windows Time service.</div>':'')+
     (fl.length?'':'<div class="no-findings">'+ic('check')+'Time hierarchy looks correct.</div>');
 })();
@@ -1302,9 +1676,18 @@ function csvAgg(key){var rows=[['Name','Count','Distinct','Details','DCs','Last'
   function spy(){var cur='overview';S.forEach(function(x){var el=qs('#sec-'+x[0]);if(el&&el.getBoundingClientRect().top<90)cur=x[0];});
     if(window.innerHeight+window.scrollY>=document.body.scrollHeight-4)cur=S[S.length-1][0];
     Array.prototype.forEach.call(document.querySelectorAll('#secnav a'),function(a){a.classList.toggle('on',a.getAttribute('data-s')===cur);});}
-  window.addEventListener('scroll',spy,{passive:true});spy();
+  if(window.__spy)window.removeEventListener('scroll',window.__spy);window.__spy=spy;window.addEventListener('scroll',spy,{passive:true});spy();
 })();
 paintIcons();
+</script>
+<script>
+var MAIN0=document.querySelector('main').innerHTML, SEL='';
+function runApp(){document.querySelector('main').innerHTML=MAIN0;D=viewFor(SEL);(0,eval)(document.getElementById('app').textContent);}
+(function(){var w=qs('#sdomwrap'),s=qs('#domsel');if(DOMS.length<2)return;w.style.display='';
+  var cnt=function(d){return arr(D0.dcs).filter(function(x){return x.domain===d;}).length;};
+  s.innerHTML='<option value="">All domains ('+arr(D0.dcs).length+' DCs)</option>'+DOMS.map(function(d){return '<option value="'+esc(d)+'">'+esc(d)+' ('+cnt(d)+')</option>';}).join('');
+  s.onchange=function(){SEL=s.value;runApp();window.scrollTo(0,0);};})();
+runApp();
 </script>
 </body></html>
 "@

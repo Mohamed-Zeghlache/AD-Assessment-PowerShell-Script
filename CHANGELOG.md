@@ -2,6 +2,70 @@
 
 All notable changes to this project are documented here.
 
+## [1.11.1] — 2026-11-14
+
+### Fixed
+- **Overview, Topology, DC Inventory**: icons (CSV download, theme, print, section and card icons) were loaded from an internet CDN and did not show on machines without internet access, such as most domain controllers. They are now embedded in each report (Bootstrap Icons, MIT licence), and the reports load nothing from the internet, which also avoids a blank page while a blocked request times out. The Inter web font is no longer downloaded; the reports use Inter when it is installed and the system font otherwise.
+
+## [1.11.0] — 2026-11-12
+
+### Added
+- **DC Posture**: LDAP client logging check in Protocols & hardening. It reads the LDAP interface event logging level on each domain controller and says whether the IP address and account of each unsigned or clear-text bind are recorded (event 2889). It is not needed once LDAP signing is required. The unsigned LDAP finding and the Security events note now name the domain controllers where this logging is off, instead of a general note.
+- **DC Posture**: Security events list the clients still using old protocols: LDAPS without channel binding (event 3039), NTLMv1 logons (4624), Kerberos tickets issued with RC4 or DES (4768 / 4769), NTLM authentications (8004 when NTLM auditing is on, otherwise 4776, with workstation names) and SMBv1 clients (3000). Busy logs are filtered on the domain controller, so only the matching events are read. Where a domain controller does not log one of these (LDAP client logging, logon, Kerberos or credential validation auditing, NTLM auditing, SMBv1 access auditing), each list says what to turn on and where, and "nothing recorded" is not shown as a clean result. Each list raises a finding.
+- **DC Posture**: in Security events, the event IDs of each list can be clicked for a description of the event (what it records, which audit setting writes it, link to the Microsoft documentation), and each row opens its full details with the description of its event.
+- **DC Posture**: each event description also shows the real text of one such event, as Windows wrote it on a domain controller during the period (in the DC's language). The summary above it is labelled as the report's own explanation.
+
+### Changed
+- **DC Posture**: security events cover the last 30 days by default (was 7); `-EventDays` still sets it.
+- **DC Posture**: security events are read much faster. Events are filtered on each domain controller and only their data is fetched; the full message text, which Get-WinEvent formats for every event at the cost of an extra round trip each over the network, is no longer built.
+
+### Fixed
+- **DC Posture, Server Inventory**: Exchange servers were also counted from their transport configuration objects ("Mailbox" and "Frontend" under each server), so one Exchange server showed as three in the Windows Server 2025 readiness check. Only the server objects are read now.
+
+## [1.10.0] — 2026-11-10
+
+### Added
+- **Server Inventory — changes since an earlier run**: `-CompareWith` takes an earlier report (or a data file saved with the new `-ExportJson`) and adds a Changes section: servers new in AD or gone, servers read now and not before or the reverse, Windows version changes, updates installed since, SQL Server instances added or removed, and each finding before and now. Summary cards show the change next to each figure, and each server's details list what changed for it.
+- **Server Inventory**: servers not restarted for `-PatchDays` days are flagged (updates installed since the last boot are not active yet), and uptime shows in the server list and in Updates & restart.
+- **Server Inventory**: a "Windows out of support" summary card, from the operating system recorded in AD.
+
+### Removed
+- **Server Inventory**: the AD cleanup section and the stale and disabled server findings, already covered by Account Security. Stale and disabled servers stay in the server list, with the reason they were not contacted.
+
+## [1.9.0] — 2026-11-08
+
+### Added
+- **Server Inventory** (`AD-ServerInventory.ps1`, standalone): every server in the forest, from AD and from each server. Hardware (manufacturer, model, physical or virtual, serial, sockets/cores, memory), Windows edition and build, roles and features, SQL Server instances, failover clusters and their roles, last update and pending restart, services running under domain accounts, AD site, DNS consistency, and stale or disabled server objects. Windows Server and SQL Server end-of-support status from the Microsoft lifecycle dates. Optional `-IncludeActivation` (Windows activation channel). Servers are inventoried in parallel with a time limit per server.
+- **Server Inventory — management access**: for the servers that could not be read, the report tells a server that is up but blocked (SMB or RDP answers, RPC and WinRM don't, or the dynamic RPC ports are closed) from one that does not answer, an access-denied account, a DNS failure or a timeout, and groups them by subnet and AD site with what to open from the audit host.
+- **Test-ServerAccess** (`Test-ServerAccess.ps1`): the same DNS, port, DCOM and WinRM tests for a list of servers, with a verdict per server.
+
+### Changed
+- **Server Inventory**: the summary cards are split into what AD gives for every server and what was read from the servers that answered; sections built on the servers that were read say how many that is; info tips say where each figure comes from; servers that could not be read show the reason instead of blank columns.
+
+### Fixed
+- **DC Posture**: the report data is written by the script's own JSON writer. The .NET serializer could spend a very long time on PowerShell-wrapped values before failing, which made some runs take many minutes longer than the checks themselves.
+- **Server Inventory**: summary cards show Windows Server and SQL Server versions (coloured by support status, click to filter); the report is scaled down to fit more on screen.
+- **Server Inventory**: the Roles chart leaves out the features Windows installs on every server (they stay listed in each server's details), file-server role services are read, and SQL Server instances with no update installed are flagged.
+- **Server Inventory**: same JSON fix; DCOM connections (wrong session options) and servers reachable only over WinRM; the console shows the elapsed time at each step.
+
+## [1.8.0] — 2026-11-08
+
+### Changed
+- **DC Posture**: covers every domain in the forest. Domain controllers, DES-only accounts, security events, time sync, partition backups, SYSVOL replication and domain functional levels are collected per domain, and the report has a domain selector to show the whole forest or one domain at a time.
+- **DC Posture**: domain controllers are checked several at a time (settings, event logs, time sync) on Windows PowerShell 5.1. New `-Throttle` parameter (default 10; 1 checks them one by one).
+- **DC Posture**: time sync follows the forest hierarchy. Only the forest-root PDC emulator should use external NTP, a child-domain PDC set to manual NTP is flagged, and each DC's offset is measured against the PDC of its own domain.
+- **DC Posture**: no longer reads every user and computer in the domain. Those queries (accounts without AES keys, RC4-only accounts, legacy systems) were no longer shown in the report and made it slow in large domains.
+
+### Fixed
+- **DC Posture**: the port test resolves the DC name once and tries each IPv4 address, so a slow DNS answer or a stale record no longer makes a reachable DC look unreachable.
+- **DC Posture**: event logs with no matching events are recognised on non-English Windows too.
+
+## [1.7.1] — 2026-10-12
+
+### Fixed
+- **All-in-one report**: clicking a section link in Account security (Password Policy, krbtgt, LAPS…) loaded the whole suite inside the module pane. In-page links now scroll within the module report, and external links open in a new tab, for every module.
+- **Account Security**: side navigation scrolls to the section directly instead of relying on `#` links, so it also works when the report is embedded elsewhere.
+
 ## [1.7.0] — 2026-10-11
 
 ### Added

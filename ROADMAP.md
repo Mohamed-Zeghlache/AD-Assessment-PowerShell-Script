@@ -4,7 +4,7 @@ This repository is the beginning of a broader **Active Directory Audit Suite**.
 
 ## Shipped modules
 
-Overview, Topology, DC Inventory, Account Security, Trust Relationships, GPO Policy Analyzer, DNS Health, Group & OU Structure, and DC Posture. Additional modules covering other areas of AD health and security are in development and will be added to this repository one by one as they are ready.
+Overview, Topology, DC Inventory, Account Security, Trust Relationships, GPO Policy Analyzer, DNS Health, Group & OU Structure, DC Posture, and Server Inventory. Additional modules covering other areas of AD health and security are in development and will be added to this repository one by one as they are ready.
 
 ## The all-in-one report
 

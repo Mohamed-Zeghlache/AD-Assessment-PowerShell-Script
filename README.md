@@ -61,7 +61,8 @@ Keep all module scripts in the same folder as `AD-AuditSuite.ps1` (or point `-Sc
 | **GPO Policy Analyzer** | `GPO-PolicyAnalyzer.ps1` | Backs up every GPO, parses Registry.pol/GptTmpl.inf directly, resolves settings via ADMX/ADML, flags every setting where GPOs disagree, and shows WMI filters that may explain them |
 | **DNS Health** | `AD-DNSHealth.ps1` | Per-zone/per-server DNS configuration (AD-integration, dynamic updates, aging/scavenging, DNSSEC) plus live per-DC resolution health and lingering DC record detection |
 | **Group & OU Structure** | `AD-GroupOUStructure.ps1` | Recursive group-nesting graph with circular-nesting/empty-group/large-group detection, OU hierarchy with per-OU counts and tiering recommendation, and an IDFix scan for Entra ID/M365 sync blockers |
-| **DC Posture** | `AD-DCPosture.ps1` | Per-DC protocol/hardening checks (LDAP signing, SMB signing, NTLM, Kerberos encryption, etc.), security events (lockouts, failed logons, password spray), time-sync hierarchy, backup/recovery readiness, and Windows Server 2025 readiness |
+| **DC Posture** | `AD-DCPosture.ps1` | Every domain in the forest: per-DC protocol/hardening checks (LDAP signing, SMB signing, NTLM, Kerberos encryption, etc.), security events (lockouts, failed logons, password spray), time-sync hierarchy, backup/recovery readiness, and Windows Server 2025 readiness |
+| **Server Inventory** | `AD-ServerInventory.ps1` | Every server in the forest: OS and lifecycle, roles, SQL Server instances, failover clusters, hardware, physical or virtual, patching and uptime, service accounts, what blocks the servers that cannot be read, and what changed since an earlier run. Standalone (not part of the all-in-one report) |
 
 Each module has its own distinct visual design so reports are instantly recognisable.
 
@@ -179,12 +180,36 @@ Three sections in one report. **Group nesting** — a security-group membership 
 
 ![AD DC Posture demo](docs/AD-DCPosture-demo.gif)
 
-Domain-controller hardening and operational readiness in five areas. **Protocols & hardening** — per DC: LDAP signing, LDAP channel binding, LDAPS certificate, NTLM level/auditing, LM hash storage, SMB signing, SMBv1, SSL/TLS versions, LLMNR, NetBIOS, WDigest, LSA protection, Kerberos encryption types, Print Spooler, plus DES-only accounts domain-wide. **Security events** (last N days, every DC) — lockouts (4740), failed logons (4625) with password-spray detection, Kerberos pre-auth failures (4771), privileged group changes, cleared audit logs (1102), and unsigned/clear-text LDAP binds with the offending clients. **Time sync hierarchy** — platform (physical, VMware, Hyper-V, Azure), configured type and NTP server, whether the setting comes from Group Policy, actual source, last successful sync, and offset vs the PDC. **Backup & recovery readiness** — AD Recycle Bin, tombstone lifetime, last backup per partition, SYSVOL replication (DFSR vs FRS). **Windows Server 2025 readiness** — only requirements documented by Microsoft, each linked to its Microsoft source: forest/domain functional level 2016+, DC versions, SYSVOL on DFSR, DES-only accounts and NTLMv1 (both removed in Windows Server 2025), and Exchange support (2019 CU14 or later, or Exchange SE). Registry values are read over CIM/DCOM (no WinRM needed); event logs over RPC. Unreachable DCs are reported, never waited on.
+Domain-controller hardening and operational readiness in five areas. **Protocols & hardening** — per DC: LDAP signing, LDAP channel binding, LDAP client logging (whether event 2889 is recorded), LDAPS certificate, NTLM level/auditing, LM hash storage, SMB signing, SMBv1, SSL/TLS versions, LLMNR, NetBIOS, WDigest, LSA protection, Kerberos encryption types, Print Spooler, plus DES-only accounts in every domain. **Security events** (last N days, every DC) — lockouts (4740), failed logons (4625) with password-spray detection, Kerberos pre-auth failures (4771), privileged group changes, cleared audit logs (1102), unsigned/clear-text LDAP binds with the offending clients, and the clients still using old protocols: LDAPS without channel binding (3039), NTLMv1 logons (4624), Kerberos tickets issued with RC4 or DES (4768/4769), NTLM authentications (8004, or 4776 with workstation names) and SMBv1 (3000). Where a DC does not log one of these, the report says what to turn on and on which DCs. **Time sync hierarchy** — platform (physical, VMware, Hyper-V, Azure), configured type and NTP server, whether the setting comes from Group Policy, actual source, last successful sync, and offset vs the PDC of the DC's own domain (only the forest-root PDC should use external NTP). **Backup & recovery readiness** — AD Recycle Bin, tombstone lifetime, last backup per partition, SYSVOL replication (DFSR vs FRS) in every domain. **Windows Server 2025 readiness** — only requirements documented by Microsoft, each linked to its Microsoft source: forest/domain functional level 2016+, DC versions, SYSVOL on DFSR, DES-only accounts and NTLMv1 (both removed in Windows Server 2025), and Exchange support (2019 CU14 or later, or Exchange SE). Registry values are read over CIM/DCOM (no WinRM needed); event logs over RPC. Unreachable DCs are reported, never waited on.
 
-DC Posture covers the domain it runs in; in a multi-domain forest, run it once per domain.
+DC Posture covers every domain in the forest. In the report, a domain selector shows the whole forest or one domain at a time. Domain controllers are checked several at a time (`-Throttle`, default 10) on Windows PowerShell 5.1, so large environments don't need PowerShell 7.
 
 ```powershell
 .\scripts\AD-DCPosture.ps1
+```
+
+---
+
+## Server Inventory
+
+![AD Server Inventory demo](docs/AD-ServerInventory-demo.gif)
+
+An inventory of every server in the forest, in the spirit of a software-asset-management discovery. **From AD** (no connection to the servers): server objects in every domain (Windows and non-Windows), OU, last activity, and the roles AD already knows about — domain controllers, SQL Server (`MSSQLSvc` SPNs), failover clusters, Exchange, certificate authorities and Configuration Manager management points — plus the AD site of each server from the AD subnets. **From each server** (WMI over DCOM, WinRM as fallback): manufacturer, model, physical or virtual, serial number, CPU sockets / cores / logical processors, memory, IP addresses, Windows edition and build, last boot and uptime, installed roles and features, last installed update, pending restart, services running under domain accounts, SQL Server instances (edition, version, service account), and failover cluster nodes and roles. **Checks**: Windows Server and SQL Server end of support (Microsoft lifecycle dates, each linked to its source), update age, servers not restarted for `-PatchDays` days, pending restart, DNS record vs the server's real IP, IP not in any AD subnet. Stale and disabled computer objects are covered by Account Security.
+
+The report keeps what AD gives for every server (OS version, lifecycle, roles registered in AD) apart from what could only be read from the servers that answered (hardware, installed roles, updates, services): the summary cards come in those two groups, sections built on the servers that were read say how many that is, and info tips (ⓘ) say where each figure comes from. Servers that could not be read show the reason in the server list instead of blank columns.
+
+**Management access** explains the servers that could not be read, grouped by subnet and AD site: up but blocked (TCP 445 or 3389 answers while RPC 135 and WinRM 5985 do not, or 135 answers but the dynamic RPC ports don't), no answer at all, access denied, name not in DNS, timed out — with what to open or fix from the audit host. `Test-ServerAccess.ps1` runs the same tests on a list of servers from the console. `-IncludeActivation` adds the Windows activation channel (KMS, MAK, OEM…), which is slower to read.
+
+Servers are inventoried 20 at a time (`-Throttle`) with a time limit per server (`-ServerTimeoutSec`, default 90 s), so a few hundred servers take minutes. Disabled servers, servers inactive in AD for more than `-StaleDays` (default 90) and non-Windows systems are listed from AD only and never contacted. A domain selector shows the whole forest or one domain at a time.
+
+**Changes since an earlier run**: `-CompareWith` takes an earlier report (or a `.json` saved with `-ExportJson`) and adds a Changes section: servers new in AD or gone, servers read now and not before (after a firewall or permission change) or the reverse, Windows version changes, updates installed since, SQL Server instances added or removed, and every finding before and now. The summary cards show the change next to each figure, and each server's details list what changed for it. The earlier run's data is copied into the new report, so it stays readable on its own.
+
+```powershell
+.\scripts\AD-ServerInventory.ps1
+.\scripts\AD-ServerInventory.ps1 -SearchBase "OU=Servers,DC=contoso,DC=com"
+.\scripts\AD-ServerInventory.ps1 -SkipRemote          # from AD only, no connection to the servers
+.\scripts\AD-ServerInventory.ps1 -CompareWith .\AD_ServerInventory_20261012_093000.html   # what changed since that run
+.\scripts\Test-ServerAccess.ps1 -ComputerName app01.contoso.com, app02.contoso.com   # what blocks these servers
 ```
 
 ---
@@ -198,7 +223,7 @@ Every module accepts:
 | `-OutputPath` | current directory | Folder to write the HTML report to |
 | `-OpenReport` | `$true` | Open the report in the default browser when finished |
 
-Some modules add their own (`-StaleDays` on Overview, `-ForestName`/`-ReplDelayIntraSiteHours`/`-ReplDelayInterSiteHours` on Topology, `-SkipHardware` on DC Inventory, `-InactiveDays`/`-StaleComputerDays`/`-ServiceAccountStalePasswordDays` on Account Security, `-TestConnectivity` on Trust Relationships, `-SkipExport`/`-GPONames` on GPO Policy Analyzer, `-SkipLiveTests`/`-Server` on DNS Health, `-DeepNestingThreshold`/`-SearchBase` on Group & OU Structure, `-EventDays`/`-SkipEvents`/`-SkipTime` on DC Posture). Run `Get-Help .\scripts\<script>.ps1 -Full` for details.
+Some modules add their own (`-StaleDays` on Overview, `-ForestName`/`-ReplDelayIntraSiteHours`/`-ReplDelayInterSiteHours` on Topology, `-SkipHardware` on DC Inventory, `-InactiveDays`/`-StaleComputerDays`/`-ServiceAccountStalePasswordDays` on Account Security, `-TestConnectivity` on Trust Relationships, `-SkipExport`/`-GPONames` on GPO Policy Analyzer, `-SkipLiveTests`/`-Server` on DNS Health, `-DeepNestingThreshold`/`-SearchBase` on Group & OU Structure, `-EventDays`/`-SkipEvents`/`-SkipTime`/`-Throttle` on DC Posture, `-SearchBase`/`-StaleDays`/`-PatchDays`/`-Throttle`/`-ServerTimeoutSec`/`-IncludeActivation`/`-SkipRemote` on Server Inventory). Run `Get-Help .\scripts\<script>.ps1 -Full` for details.
 
 > **Execution policy:** if a script is blocked, run it for the current process only:
 > ```powershell
@@ -230,7 +255,7 @@ Install-WindowsFeature RSAT-AD-PowerShell, GPMC, RSAT-DNS-Server
 
 For the richest per-DC detail (Topology and DC Inventory), the running account should be able to reach the DCs via **WinRM** or **WMI/DCOM**. When a DC can't be reached, the report degrades gracefully and shows the fields it could not collect as *unavailable* rather than failing.
 
-**GPO Policy Analyzer** additionally requires the **GroupPolicy** module (RSAT-GPMC) to back up GPOs, and read access to SYSVOL. **DNS Health** benefits from the **DnsServer** module (RSAT-DNS) for full zone/server detail, but degrades to AD-only checks without it. **Account Security** needs read access to the Password Settings Container (Domain Admins by default, or a delegated read permission) to list fine-grained password policies. **DC Posture** reads registry values over CIM/DCOM and security event logs over RPC on every DC, so run it as a domain admin, or with Event Log Readers plus remote registry read granted on the DCs.
+**GPO Policy Analyzer** additionally requires the **GroupPolicy** module (RSAT-GPMC) to back up GPOs, and read access to SYSVOL. **DNS Health** benefits from the **DnsServer** module (RSAT-DNS) for full zone/server detail, but degrades to AD-only checks without it. **Account Security** needs read access to the Password Settings Container (Domain Admins by default, or a delegated read permission) to list fine-grained password policies. **DC Posture** reads registry values over CIM/DCOM and security event logs over RPC on every DC, so run it as a domain admin, or with Event Log Readers plus remote registry read granted on the DCs. **Server Inventory** needs local administrator rights on the servers and RPC/DCOM (or WinRM) access to them for the full inventory; without them, servers are still listed from AD.
 
 ---
 
