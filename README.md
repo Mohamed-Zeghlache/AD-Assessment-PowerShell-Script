@@ -31,17 +31,18 @@ Or run them **all at once** with the all-in-one report.
 
 `AD-AuditSuite.ps1` runs every module and combines the results into **one interactive report**:
 
-- **Dashboard** — findings by severity and by module, domain controller health (reachability, replication, time, protocol hardening), Windows Server 2025 readiness, security events, privileged and risky accounts, Group Policy, DNS and recovery figures, and the top priorities across all modules.
+- **Dashboard** — findings by severity and by module, domain controller health (reachability, replication, time, protocol hardening), Windows Server 2025 readiness, security events, privileged and risky accounts, Group Policy, DNS and recovery figures, servers (Windows and SQL Server support status, servers read, updates and restarts), and the top priorities across all modules.
 - **Search** across every finding and module from the top bar.
 - **Every module's full report** in the same file, one section at a time.
 - **Findings PDF** in one click (browser print → Save as PDF): an executive summary, each area explained in plain language with its key figures and charts, every finding with its recommendation, a prioritised remediation plan, and a methodology appendix.
 
-Each module runs in its own PowerShell process with a timeout, so one failing module never stops the others; the report shows what completed and why anything did not. Scales automatically to the screen (laptop or large monitor), with light and dark themes.
+Server Inventory contacts every server, so it is usually the longest module; leave it out with `-Skip ServerInventory` or run it from AD only with `-SkipRemote`. Each module runs in its own PowerShell process with a timeout, so one failing module never stops the others; the report shows what completed and why anything did not. Scales automatically to the screen (laptop or large monitor), with light and dark themes.
 
 ```powershell
 .\scripts\AD-AuditSuite.ps1                                    # run all modules
 .\scripts\AD-AuditSuite.ps1 -Skip GPOPolicyAnalyzer            # leave a module out
 .\scripts\AD-AuditSuite.ps1 -ModuleArguments @{ DCPosture = '-EventDays 3' }
+.\scripts\AD-AuditSuite.ps1 -ModuleArguments @{ ServerInventory = '-SkipRemote' }   # server inventory from AD only
 .\scripts\AD-AuditSuite.ps1 -RebuildFrom .\AD_AuditSuite_run_20261005_101849   # rebuild the report without re-running anything
 ```
 

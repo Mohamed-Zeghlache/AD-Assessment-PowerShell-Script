@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## [1.12.0] — 2026-11-15
+
+### Added
+- **All-in-one report**: Server Inventory is now one of the modules (part "Servers", run last). Its findings appear in the dashboard, search, top priorities and the findings PDF: Windows and SQL Server versions out of support or ending within a year, servers not updated or not restarted, DNS records, activation, servers not in an AD subnet, and servers that could not be read. The dashboard has a Servers card (Windows support status, servers read, SQL Server, clusters, updates and restarts) and the PDF a Servers section with its own figures and lists. `-Skip ServerInventory` leaves it out; `-ModuleArguments @{ ServerInventory = '-SkipRemote' }` runs it from AD only.
+
 ## [1.11.1] — 2026-11-14
 
 ### Fixed

@@ -16,6 +16,7 @@
       Identity & access      AccountSecurity, GroupOUStructure
       Policy & configuration GPOPolicyAnalyzer, DNSHealth
       Security & readiness   DCPosture
+      Servers                ServerInventory (contacts every server: can be the longest module)
 
     READ-ONLY: this script only starts the module scripts, which are read-only.
 
@@ -36,6 +37,10 @@
     .\AD-AuditSuite.ps1 -RebuildFrom .\AD_AuditSuite_run_20261005_101849
 .EXAMPLE
     .\AD-AuditSuite.ps1 -Skip GPOPolicyAnalyzer -ModuleArguments @{ DCPosture = '-EventDays 3' }
+.EXAMPLE
+    # Server inventory from AD only (no connection to the servers), or leave it out
+    .\AD-AuditSuite.ps1 -ModuleArguments @{ ServerInventory = '-SkipRemote' }
+    .\AD-AuditSuite.ps1 -Skip ServerInventory
 
 .NOTES
     Author  : Mohamed ZEGHLACHE
@@ -71,7 +76,7 @@ if ($RebuildFrom) {
 
 Write-Host "AD Audit Suite - all-in-one report" -ForegroundColor Cyan
 Write-Host "==================================" -ForegroundColor Cyan
-Write-Host "build: v14-suite" -ForegroundColor DarkGray
+Write-Host "build: v15-suite" -ForegroundColor DarkGray
 
 # id, name, title, part, script file
 $Catalog = @(
@@ -83,7 +88,8 @@ $Catalog = @(
     @('gou',  'GroupOUStructure',   'Groups, OUs & directory sync', 'Identity & access',      'AD-GroupOUStructure.ps1'),
     @('gpo',  'GPOPolicyAnalyzer',  'Group Policy',                 'Policy & configuration', 'GPO-PolicyAnalyzer.ps1'),
     @('dns',  'DNSHealth',          'DNS health',                   'Policy & configuration', 'AD-DNSHealth.ps1'),
-    @('auth', 'DCPosture',          'DC posture & readiness',       'Security & readiness',   'AD-DCPosture.ps1')
+    @('auth', 'DCPosture',          'DC posture & readiness',       'Security & readiness',   'AD-DCPosture.ps1'),
+    @('srv',  'ServerInventory',    'Server inventory',             'Servers',                'AD-ServerInventory.ps1')
 )
 # Accept the module's previous name (AuthReadiness) for compatibility
 if ($Modules) { $Modules = @($Modules | ForEach-Object { if ($_ -eq 'AuthReadiness') { 'DCPosture' } else { $_ } }) }
@@ -371,6 +377,7 @@ iframe.rep{height:calc(100vh - 52px)!important}
 .msi{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#dff6dd;color:#107c10;flex-shrink:0}.mstatus.crit .msi{background:#fde7e9;color:#d13438}.mstatus.warn .msi{background:#fff4ce;color:#8a5a00}.msi svg{width:17px;height:17px}
 .mst{flex:1}.mst b{display:block;font-size:15px}.mst span{font-size:13px;color:var(--muted)}
 .mbtn{background:#0f6cbd;color:#fff;border:none;border-radius:4px;padding:8px 14px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}.mbtn:hover{background:#115ea3}
+.msrv{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:center}@media(max-width:1250px){.msrv{grid-template-columns:1fr}}
 .mgrid{display:grid;gap:16px;margin-bottom:16px}.g4{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g21{grid-template-columns:2fr 1fr}.g1{grid-template-columns:1fr}.g12{grid-template-columns:1fr 2fr}
 @media(max-width:1250px){.g4{grid-template-columns:repeat(2,1fr)}.g3,.g21,.g12{grid-template-columns:1fr}}
 .mcard{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:18px 20px;box-shadow:0 1.6px 3.6px rgba(0,0,0,.06),0 .3px .9px rgba(0,0,0,.05);display:flex;flex-direction:column;min-width:0}
@@ -525,8 +532,47 @@ var ADAPT={
    chk(arr(D.desOnly).length,'crit','No accounts restricted to DES (removed in Windows Server 2025)');chk(exOld,'crit','Exchange 2019 CU14 or later, or Exchange SE');chk(ntlm1,'warn','No NTLMv1 (removed in Windows Server 2025)');
    if(wc)add('crit','Not ready for Windows Server 2025 ('+wc+' blocker'+(wc===1?'':'s')+')','Resolve the blockers listed in the Windows Server 2025 readiness section before promoting the first Windows Server 2025 domain controller. Each check there links to the Microsoft documentation it is based on.');
    Object.keys(seen).forEach(function(k){f.add(seen[k].sev,k,null,seen[k].adv);});
-   return {f:f.list,x:{dcs:dcs,pdc:D.pdc,ev:EV,w25:{crit:wc,warn:ww,pass:wt-wc-ww,total:wt,list:wl},backup:BK}};}
+   return {f:f.list,x:{dcs:dcs,pdc:D.pdc,ev:EV,w25:{crit:wc,warn:ww,pass:wt-wc-ww,total:wt,list:wl},backup:BK}};},
+ srv:function(D){var f=F(),P=D.params||{},pd=num(P.patchDays)||60,G=siDate(D.generated),SV=arr(D.servers),SQ=arr(D.sql);
+   var win=0,eos=[],soon=[],os={},notUpd=0,notUpd2=0,notRst=0,pend=0,notRead=[],noNet=0,phys=0,virt=0,dnsBad=0,noAct=0,sqlNoUpd=0;
+   SV.forEach(function(s){var L=s.status!=='disabled'?siOs(s):null;
+     if(L){win++;var v=siSev(L[1],G);os[L[0]]=os[L[0]]||[0,v];os[L[0]][0]++;if(v==='crit')eos.push([s,L]);else if(v==='warn')soon.push([s,L]);}
+     if(s.status==='ok'){if(s.patchDays!=null&&s.patchDays>pd){notUpd++;if(s.patchDays>pd*2)notUpd2++;}if(s.uptimeDays!=null&&s.uptimeDays>pd)notRst++;if(s.pending)pend++;if(s.platform==='Physical')phys++;else if(s.platform==='Virtual')virt++;
+       if(s.dnsState==='mismatch'||s.dnsState==='missing')dnsBad++;if(s.act&&s.act.ok===false)noAct++;}
+     if(!s.site&&(arr(s.ips).length||arr(s.dnsIps).length)&&s.status!=='disabled')noNet++;
+     if(siContacted(s)&&s.status!=='ok')notRead.push(s);});
+   var contacted=SV.filter(siContacted).length,sqlEos=[],sqlSoon=0;
+   SQ.forEach(function(i){if(siSqlBase(i.version))sqlNoUpd++;var L=siSql(i.version);if(!L)return;var v=siSev(L[1],G);if(v==='crit')sqlEos.push([i,L]);else if(v==='warn')sqlSoon++;});
+   f.add('crit',eos.length+' servers on a Windows version out of support',eos.length,'Upgrade or replace these servers: out-of-support versions get no security updates. Where that takes time, isolate them on the network and limit who can sign in to them.');
+   f.add('warn',soon.length+' servers whose Windows support ends within a year',soon.length,'Plan the upgrade or replacement of these servers before their end-of-support date.');
+   f.add('crit',sqlEos.length+' SQL Server instances out of support',sqlEos.length,'Upgrade these instances to a supported SQL Server version, or migrate their databases.');
+   f.add('warn',sqlSoon+' SQL Server instances whose support ends within a year',sqlSoon,'Plan the upgrade of these instances before their end-of-support date.');
+   f.add('crit',notUpd2+' servers with no update installed in more than '+(pd*2)+' days',notUpd2,'Update these servers first: they have missed several monthly security updates. Then check why they stopped getting updates.');
+   f.add('warn',(notUpd-notUpd2)+' servers with no update installed for '+pd+' to '+(pd*2)+' days',notUpd-notUpd2,'Bring these servers back into the monthly update cycle and check why they stopped getting updates.');
+   f.add('warn',notRst+' servers not restarted in the last '+pd+' days',notRst,'Restart these servers in the next maintenance window: updates installed since the last boot only take effect after a restart.');
+   f.add('warn',dnsBad+' servers whose DNS record is missing or does not match their IP address',dnsBad,'Correct the DNS records of these servers, or enable dynamic DNS registration on them, so clients reach the right address.');
+   f.add('warn',noAct+' servers where Windows is not activated',noAct,'Activate Windows on these servers (KMS, MAK or AVMA, depending on how the environment is licensed).');
+   f.add('info',sqlNoUpd+' SQL Server instances with no update installed',sqlNoUpd,'Install the latest cumulative update for these instances; they still run the release or service pack build.');
+   f.add('info',pend+' servers with a restart pending',pend,'Restart these servers to finish installing updates or configuration changes.');
+   f.add('info',notRead.length+' servers that could not be read from the audit host',notRead.length,'See Management access in the Server Inventory report: it shows, per subnet, what blocks these servers and what to open. Until then, figures read from the servers do not cover them.');
+   f.add('info',noNet+' servers with an IP address in no AD subnet',noNet,'Add the missing subnets to AD Sites and Services and link them to the right site, so these servers find their nearest domain controller.');
+   var osl=Object.keys(os).map(function(k){return [k,os[k][0],os[k][1]];}).sort(function(a,b){return b[1]-a[1];});
+   return {f:f.list,x:{total:SV.length,contacted:contacted,read:SV.filter(function(s){return s.status==='ok';}).length,win:win,eos:eos.length,soon:soon.length,ok:win-eos.length-soon.length,osl:osl,eosList:eos,
+     sql:SQ.length,sqlEos:sqlEos.length,sqlEosList:sqlEos,clusters:arr(D.clusters).length,notUpd:notUpd,notRst:notRst,pend:pend,notRead:notRead,phys:phys,virt:virt,pd:pd}};}
 };
+/* Lifecycle dates for the Server Inventory reader: same table as AD-ServerInventory.ps1 (Microsoft lifecycle pages) */
+var SILOS={26100:['Windows Server 2025','2034-11-14'],20348:['Windows Server 2022','2031-10-14'],17763:['Windows Server 2019','2029-01-09'],14393:['Windows Server 2016','2027-01-12'],9600:['Windows Server 2012 R2','2023-10-10'],9200:['Windows Server 2012','2023-10-10'],
+  7601:['Windows Server 2008 R2','2020-01-14'],7600:['Windows Server 2008 R2','2020-01-14'],6003:['Windows Server 2008','2020-01-14'],6002:['Windows Server 2008','2020-01-14'],6001:['Windows Server 2008','2020-01-14'],3790:['Windows Server 2003','2015-07-14']};
+var SIOSN=[[/2025/,26100],[/2022/,20348],[/2019/,17763],[/2016/,14393],[/2012 R2/,9600],[/2012/,9200],[/2008 R2/,7601],[/2008/,6003],[/2003/,3790]];
+var SISQL={'17':['SQL Server 2025','2036-01-06'],'16':['SQL Server 2022','2033-01-11'],'15':['SQL Server 2019','2030-01-08'],'14':['SQL Server 2017','2027-10-12'],'13':['SQL Server 2016','2026-07-14'],'12':['SQL Server 2014','2024-07-09'],'11':['SQL Server 2012','2022-07-12'],'10.5':['SQL Server 2008 R2','2019-07-09'],'10':['SQL Server 2008','2019-07-09']};
+function siDate(t){var d=new Date((''+(t||'')).replace(' ','T'));return isNaN(d)?new Date():d;}
+function siSev(end,G){var d=(new Date(end+'T00:00:00')-G)/864e5;return d<0?'crit':(d<=365?'warn':'ok');}
+function siOs(s){if(!s.isWin)return null;var b=num(s.build)||num(s.buildAd);if(SILOS[b])return SILOS[b];if(!b){var o=s.os||s.osAd||'';for(var i=0;i<SIOSN.length;i++)if(SIOSN[i][0].test(o))return SILOS[SIOSN[i][1]];}return null;}
+function siSql(v){var m=/^(\d+)\.(\d+)/.exec(v||'');if(!m)return null;return SISQL[(m[1]==='10'&&+m[2]>=50)?'10.5':m[1]]||null;}
+/* Base builds of each SQL Server version and service pack (no update installed): same list as AD-ServerInventory.ps1 */
+var SIBASE={'17':['1000'],'16':['1000'],'15':['2000'],'14':['1000'],'13':['1601','4001','5026','6300'],'12':['2000','4100','5000','6024'],'11':['2100','3000','5058','6020','7001'],'10':['1600','2531','4000','5500','6000','2500']};
+function siSqlBase(v){var m=/^(\d+)\.\d+\.(\d+)\./.exec(v||'');return !!(m&&SIBASE[m[1]]&&SIBASE[m[1]].indexOf(m[2])>=0);}
+function siContacted(s){return ['ok','unreachable','denied','timeout','error'].indexOf(s.status)>=0;}
 /* ---------- build module state ---------- */
 var MODS=arr(S.modules),BY={},HTML={};
 MODS.forEach(function(m,i){m.no=i+1;BY[m.id]=m;m.f=[];m.x={};
@@ -566,10 +612,11 @@ var IC={
  flag:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3 15V1.8M3 2.2h9.2l-1.7 3.1 1.7 3.1H3"/></svg>',
  clock:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="6.5"/><path d="M8 4.2V8l2.6 1.6"/></svg>',
  dns:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="6.5"/><path d="M1.5 8h13M8 1.5c2 2.2 2 10.8 0 13M8 1.5c-2 2.2-2 10.8 0 13"/></svg>',
+ srv:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="2" y="1.8" width="12" height="5" rx="1"/><rect x="2" y="9.2" width="12" height="5" rx="1"/><path d="M4.5 4.3h.01M4.5 11.7h.01M7 4.3h4.5M7 11.7h4.5"/></svg>',
  home:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 7.2 8 2l6 5.2V14a.5.5 0 0 1-.5.5H10V10H6v4.5H2.5A.5.5 0 0 1 2 14z"/></svg>',
  arrow:'<svg viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M1 8a.5.5 0 0 1 .5-.5h11.793l-3.147-3.146a.5.5 0 0 1 .708-.708l4 4a.5.5 0 0 1 0 .708l-4 4a.5.5 0 0 1-.708-.708L13.293 8.5H1.5A.5.5 0 0 1 1 8"/></svg>'
 };
-var NAVIC={ov:'pie',dc:'dc',topo:'pulse',trust:'key',acct:'lock',gou:'grp',gpo:'gpo',dns:'dns',auth:'up'};
+var NAVIC={ov:'pie',dc:'dc',topo:'pulse',trust:'key',acct:'lock',gou:'grp',gpo:'gpo',dns:'dns',auth:'up',srv:'srv'};
 var B={blue:'#0f6cbd',sky:'#2b88d8',purple:'#8764b8',teal:'#038387',grey:'#c8c6c4',red:'#d13438',amber:'#f7a700',green:'#107c10',info:'#0f6cbd'};
 function tile(icon,bg,fg){return '<span class="mtile" style="background:'+bg+';color:'+fg+'">'+IC[icon]+'</span>';}
 function mlink(id,t){return BY[id]?'<a class="mlink" data-v="'+id+'">'+e(t)+' '+IC.arrow+'</a>':'';}
@@ -583,7 +630,7 @@ function vbars(items,h){var w=400,mx=Math.max.apply(null,items.map(function(x){r
     return '<g data-v="'+x.id+'" style="cursor:pointer"><title>'+e(x.title)+': '+x.a+' critical, '+x.b+' warnings</title>'+(hb?'<rect x="'+(cx-bw/2)+'" y="'+(y0-ha-hb)+'" width="'+bw+'" height="'+hb+'" rx="2" fill="'+B.amber+'"/>':'')+(ha?'<rect x="'+(cx-bw/2)+'" y="'+(y0-ha)+'" width="'+bw+'" height="'+ha+'" rx="2" fill="'+B.red+'"/>':'')+
       '<text x="'+cx+'" y="'+(y0-ha-hb-5)+'" text-anchor="middle" font-size="10.5" font-weight="700" fill="var(--text)">'+(num(x.a)+num(x.b)||'')+'</text><text x="'+cx+'" y="'+(pt+ch+12)+'" text-anchor="end" font-size="10.5" fill="var(--muted)" transform="rotate(-35 '+cx+' '+(pt+ch+12)+')">'+e(x.short)+'</text></g>';}).join('');
   return '<svg viewBox="0 0 '+w+' '+h+'" style="width:100%;height:'+h+'px">'+g+bars+'</svg>';}
-var SHORT={ov:'Overview',dc:'DCs',topo:'Topology',trust:'Trusts',acct:'Accounts',gou:'Groups',gpo:'GPO',dns:'DNS',auth:'DC posture'};
+var SHORT={ov:'Overview',dc:'DCs',topo:'Topology',trust:'Trusts',acct:'Accounts',gou:'Groups',gpo:'GPO',dns:'DNS',auth:'DC posture',srv:'Servers'};
 (function(){
   var ran=MODS.filter(function(m){return m.status==='ok';}),TC=0,TW=0,TI=0;MODS.forEach(function(m){TC+=m.crit;TW+=m.warn;TI+=m.info;});
   var withCrit=MODS.filter(function(m){return m.crit;}).length,TT=TC+TW+TI;
@@ -622,7 +669,11 @@ var SHORT={ov:'Overview',dc:'DCs',topo:'Topology',trust:'Trusts',acct:'Accounts'
   var cEv='<div class="mcard">'+mhead('pulse','Security events'+(ev.days?' \u2014 last '+ev.days+' days':''))+evHtml+mlink('auth','View security events')+'</div>';
   var pri=[];MODS.forEach(function(m){m.f.forEach(function(f){if(f.sev!=='info')pri.push([f,m]);});});pri.sort(function(a,b){return R[b[0].sev]-R[a[0].sev];});
   var cPri='<div class="mcard" id="mprio">'+mhead('flag','Top priorities across all modules',B.red)+(pri.length?'<div class="mprio">'+pri.slice(0,10).map(function(p){return '<div class="mp" data-v="'+p[1].id+'"><span class="mdot" style="background:'+(p[0].sev==='crit'?B.red:B.amber)+'"></span><span class="t">'+e(p[0].title)+'</span><span class="mtag">'+e(p[1].title)+'</span>'+IC.arrow+'</div>';}).join('')+'</div>':na('No critical findings or warnings.'))+'</div>';
-  h+='<div class="mgrid g3">'+cSev+cMod+cUsr+'</div><div class="mgrid g21">'+cDc+cW25+'</div><div class="mgrid g3">'+cPriv+cGrp+cPol+'</div><div class="mgrid g1">'+cEv+'</div><div class="mgrid g1">'+cPri+'</div>';
+  var sx=X('srv'),cSrv='';if(BY.srv){var spd=sx.pd||60;
+    cSrv='<div class="mcard">'+mhead('dc','Servers',B.blue)+(sx.total!=null?'<div class="msrv"><div class="mdn">'+donut([['Supported',sx.ok,B.green],['Ends within a year',sx.soon,B.amber],['Out of support',sx.eos,B.red]],136,22,[fmt(sx.win),'Windows'])+legTable([['Supported',sx.ok,B.green],['Ends within a year',sx.soon,B.amber],['Out of support',sx.eos,B.red]],sx.win)+'</div>'+
+      rowsTable([['Servers in AD',fmt(sx.total)],['Read / contacted',fmt(sx.read)+' / '+fmt(sx.contacted),sx.read<sx.contacted?'#8a5a00':'',sx.read<sx.contacted?fmt(sx.contacted-sx.read)+' not read':''],['SQL Server instances',fmt(sx.sql),'',sx.sqlEos?'<span style="color:'+B.red+'">'+fmt(sx.sqlEos)+' out of support</span>':''],['Failover clusters',fmt(sx.clusters)],['No update in '+spd+'+ days',fmt(sx.notUpd),sx.notUpd?'#8a5a00':'','of the servers read'],['Not restarted in '+spd+'+ days',fmt(sx.notRst),sx.notRst?'#8a5a00':'','of the servers read']])+'</div>'
+      :na('Server inventory did not run.'))+mlink('srv','View server inventory')+'</div>';}
+  h+='<div class="mgrid g3">'+cSev+cMod+cUsr+'</div><div class="mgrid g21">'+cDc+cW25+'</div><div class="mgrid g3">'+cPriv+cGrp+cPol+'</div>'+(cSrv?'<div class="mgrid g1">'+cSrv+'</div>':'')+'<div class="mgrid g1">'+cEv+'</div><div class="mgrid g1">'+cPri+'</div>';
   /* run information */
   h+='<div class="mcard">'+mhead('clock','Run information')+'<div class="mtbl"><table><tr><th>#</th><th>Module</th><th>Script</th><th>Duration</th><th>Result</th></tr>'+MODS.map(function(m){
      return '<tr><td>'+m.no+'</td><td><a class="mlink in" data-v="'+m.id+'">'+e(m.title)+'</a></td><td>'+e(m.script)+'</td><td>'+e(m.duration||'')+'</td><td>'+(m.status==='ok'?'<span class="mpill" style="background:#dff6dd;color:#107c10">Completed</span>'+(m.read?'':' <small>data not read for the dashboard</small>'):(m.status==='skipped'?'<span class="mpill" style="background:#f3f2f1;color:#605e5c">Skipped</span> <small>'+e(m.error||'')+'</small>':'<span class="mpill" style="background:#fde7e9;color:#a4262c">Failed</span> <small>'+e(m.error||'')+'</small>'))+'</td></tr>';}).join('')+'</table></div></div></div>';
@@ -680,6 +731,7 @@ var ABOUT={
  gou:'Groups decide who can access what, and OUs decide which policies and delegations apply. Nesting loops and deep chains make effective access hard to understand, and the directory-sync checks show which objects would fail or be altered when synchronised to Entra ID.',
  gpo:'Group Policy configures security settings on every computer and user. This area inventories all GPOs, finds settings that conflict or are never applied, checks AD and SYSVOL consistency and compares key settings with a hardening baseline.',
  dns:'Active Directory depends on DNS to locate domain controllers and services. Misconfigured zones, insecure updates or stale records can break logons and replication, or let an attacker redirect traffic.',
+ srv:'Servers run the applications that depend on Active Directory. This area covers every server object in the forest: the operating system and its end of support, SQL Server instances, failover clusters, updates and restarts, and the servers that could not be read from the audit host, with the reason. Figures read from the servers cover the servers that answered; operating system and lifecycle come from AD and cover every server.',
  auth:'This area reviews how domain controllers authenticate clients and how ready the environment is for recovery and for Windows Server 2025: protocol hardening (LDAP, NTLM, SMB, TLS), security events over the collection window, the time hierarchy that Kerberos depends on, backups and the migration prerequisites.'
 };
 var DESC={
@@ -713,6 +765,11 @@ var DESC={
  'Unsigned or clear-text LDAP clients':'Clients that bind to LDAP without signing or encryption and will fail once LDAP signing is required.'
 };
 var STORY={
+ srv:function(m){var x=m.x;
+   return '<p>The forest has <b>'+pl(x.total,'server object')+'</b>. '+pl(x.contacted,'server was','servers were')+' contacted and <b>'+fmt(x.read)+'</b> could be read'+(x.read?' ('+fmt(x.phys)+' physical, '+fmt(x.virt)+' virtual)':'')+'. '+(x.contacted>x.read?'The other '+pl(x.contacted-x.read,'server')+' could not be read from the audit host; the Server Inventory report shows, per subnet, what blocks them and what to open.':'')+'</p>'+
+     '<p>'+(x.eos?'<b>'+pl(x.eos,'server runs','servers run')+' a Windows version that is out of support</b> and no longer gets security updates. ':'No server runs a Windows version that is out of support. ')+(x.soon?pl(x.soon,'server reaches','servers reach')+' end of support within a year. ':'')+
+     pl(x.sql,'SQL Server instance')+' and '+pl(x.clusters,'failover cluster')+' were found'+(x.sqlEos?', and <b>'+pl(x.sqlEos,'instance is','instances are')+' out of support</b>':'')+'.</p>'+
+     ((x.notUpd||x.notRst)?'<p>Among the servers that could be read, '+lst([x.notUpd?pl(x.notUpd,'server has','servers have')+' no update installed in the last '+x.pd+' days':'',x.notRst?pl(x.notRst,'server has','servers have')+' not restarted in that time, so updates installed since are not active':''])+'.</p>':'');},
  ov:function(m){var D=m.d,t=D.totals||{},a=D.accounts||{},fo=D.forest||{},lvl=(''+(fo.forestMode||'')).replace(/Windows|Forest/g,' ').trim(),old=/2003|2008|2012/.test(fo.forestMode);
    return '<p>The forest <b>'+e(fo.forestName||S.forest)+'</b> contains '+pl(fo.domainCount||arr(D.domains).length,'domain')+' across '+pl(fo.siteCount,'site')+' and runs at the <b>Windows Server '+e(lvl)+'</b> functional level'+(old?', which is below the level required by current Windows Server releases':'')+'. The directory holds '+pl(t.users,'user account')+', '+pl(t.computers,'computer')+', '+pl(t.groups,'group')+' and '+pl(t.ous,'organizational unit')+', managed by '+pl(t.gpos,'Group Policy object')+'.</p>'+
      '<p>Of the '+fmt(a.enabled)+' enabled user accounts, <b>'+fmt(a.stale)+'</b> have not signed in for more than '+fmt(D.staleDays||180)+' days and '+fmt(a.neverLoggedOn)+' have never signed in. '+pl(a.pwdNeverExp,'account has','accounts have')+' a password that never expires. Unused accounts are a common way into a domain, because nobody notices when they are misused.</p>';},
@@ -748,6 +805,12 @@ var STORY={
      '<p><b>Windows Server 2025:</b> '+(W.crit?'the environment is not yet ready; '+pl(W.crit,'blocker')+' must be resolved before the first Windows Server 2025 domain controller is promoted.':'no blockers were found.')+' <b>Time:</b> '+(pt?'the PDC emulator reports '+q(pt.title)+'.':'the time hierarchy shows no issue at the PDC emulator.')+' <b>Recovery:</b> '+(BK.recycleBinEnabled?'the AD Recycle Bin is enabled':'the AD Recycle Bin is not enabled')+(old.length?' and the '+lst(old)+' '+(old.length===1?'partition has':'partitions have')+' no recent backup.':' and every partition has a recent backup.')+'</p>';}
 };
 var PR={
+ srv:function(m){var x=m.x,cols={crit:C.red,warn:C.amb,ok:C.grn};
+   return {top:pfig([['Servers in AD',fmt(x.total)],['Read / contacted',fmt(x.read)+' / '+fmt(x.contacted),x.read<x.contacted?'w':''],['Windows out of support',x.eos,x.eos?'c':'g'],['Support ends < 1 year',x.soon,x.soon?'w':''],['SQL Server instances',fmt(x.sql)],['SQL out of support',x.sqlEos,x.sqlEos?'c':''],['Failover clusters',x.clusters],['Not updated '+x.pd+'+ days',x.notUpd,x.notUpd?'w':'']])+
+     pcr(pdonut('Windows support status',[['Supported',x.ok,C.grn],['Ends within a year',x.soon,C.amb],['Out of support',x.eos,C.red]],[fmt(x.win),'Windows']),pbars('Operating systems',x.osl.slice(0,8).map(function(o){return [o[0],o[1],cols[o[2]]];}))),
+   det:ptab('Servers on a Windows version out of support',['Server','Domain','Operating system','End of support'],x.eosList.map(function(p){return [p[0].name,p[0].domain||'',p[1][0],p[1][1]];}),40)+
+     ptab('SQL Server instances out of support',['Server','Instance','Version','End of support'],x.sqlEosList.map(function(p){return [p[0].server||'',p[0].instance||'',p[1][0]+(p[0].version?' ('+p[0].version+')':''),p[1][1]];}),40)+
+     ptab('Servers that could not be read',['Server','Subnet','AD site','Reason'],x.notRead.map(function(s){return [s.name,s.subnet||'',s.site||'',s.statusText||''];}),40)};},
  ov:function(m){var D=m.d,t=D.totals||{},a=D.accounts||{},c=D.computers||{},fo=D.forest||{},g=D.groups||{};
    return {top:pfig([['Users',fmt(t.users)],['Computers',fmt(t.computers)],['Groups',fmt(t.groups)],['OUs',fmt(t.ous)],['Group Policies',fmt(t.gpos)],['Contacts',fmt(t.contacts)],['Domains',fo.domainCount],['Sites',fo.siteCount],['Global catalogs',fo.gcCount],['Tombstone',fo.tombstoneDays!=null?fo.tombstoneDays+' d':''],['Forest level',(''+(fo.forestMode||'')).replace(/Windows|Forest/g,' ').trim(),/2008|2012|2003/.test(fo.forestMode)?'w':''],['Schema',fo.schemaVersion]])+
      pcr(pdonut('User accounts',[['Active',Math.max(0,num(a.enabled)-num(a.stale)),C.grn],['Stale',num(a.stale),C.amb],['Disabled',num(a.disabled),'#cbd5e1'],['Locked',num(a.locked),C.red]],[fmt(num(a.enabled)+num(a.disabled)),'users']),
